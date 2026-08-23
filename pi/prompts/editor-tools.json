@@ -1,0 +1,43 @@
+{
+  "read": {
+    "description": "Read a file from the project or the current Neovim editor buffer. If path is omitted, this reads the current editor buffer, including unsaved changes. If path points to an open buffer, unsaved editor contents are returned instead of on-disk contents.",
+    "promptSnippet": "Read project files or the current editor buffer; omit path to inspect the current file with unsaved edits",
+    "promptGuidelines": [
+      "Prefer omitting path when the user asks about the current file or unsaved editor state.",
+      "Use this instead of normal file reads when the user refers to what they are editing right now."
+    ]
+  },
+  "editor_context": {
+    "description": "Get a live snapshot of the current Neovim editing context, including the active buffer, last visual selection, and diagnostics.",
+    "promptGuidelines": [
+      "Use this when the user asks about code they are currently editing or when unsaved buffer state matters."
+    ]
+  },
+  "editor_visible_buffers": {
+    "description": "Read the visible file buffers in the current Neovim tab, including unsaved changes, so you can inspect the code the user is actively working across.",
+    "promptGuidelines": [
+      "Use this when the user asks broadly about the code they are working on, what is open in the editor, or wants feedback across multiple visible files or splits."
+    ]
+  },
+  "editor_current_buffer": {
+    "description": "Read the current Neovim buffer, including unsaved changes. Optionally target another open file path.",
+    "promptGuidelines": [
+      "Prefer this over regular file reads when the user is actively editing a file or when unsaved changes may matter."
+    ]
+  },
+  "editor_selection": {
+    "description": "Read the last visual selection from Neovim for the current buffer or a specific open file."
+  },
+  "editor_diagnostics": {
+    "description": "Get live diagnostics from Neovim. Defaults to all open buffers, or target a specific file path."
+  },
+  "editor_lsp_hover": {
+    "description": "Get Neovim LSP hover information at a position, defaulting to the current cursor location."
+  },
+  "editor_lsp_definition": {
+    "description": "Get Neovim LSP definition results at a position, defaulting to the current cursor location."
+  },
+  "editor_lsp_references": {
+    "description": "Get Neovim LSP references at a position, defaulting to the current cursor location."
+  }
+}
