@@ -661,7 +661,6 @@ function M.send(prompt, slot)
       end
       log_conversation(prompt, full_response, err, label)
     end,
-    nil,
     { slot = slot }
   )
 end

@@ -433,7 +433,7 @@ local function split_slot_model(slot)
   return slot.provider or M.config.provider, slot.model
 end
 
-local function apply_slot(slot, on_done)
+local function apply_slot(client, slot, on_done)
   if not slot or not slot.model then
     on_done(true, nil)
     return
@@ -445,7 +445,7 @@ local function apply_slot(slot, on_done)
     return
   end
 
-  transport.set_model(provider, model_id, function(ok, err)
+  client.set_model(provider, model_id, function(ok, err)
     if not ok then
       on_done(false, string.format("Failed to switch model to %s: %s", model_id, tostring(err)))
       return
@@ -456,7 +456,7 @@ local function apply_slot(slot, on_done)
       return
     end
 
-    transport.set_thinking_level(slot.thinking, function(thinking_ok, thinking_err)
+    client.set_thinking_level(slot.thinking, function(thinking_ok, thinking_err)
       if not thinking_ok then
         on_done(false, "Failed to set thinking level: " .. tostring(thinking_err))
         return
@@ -466,29 +466,61 @@ local function apply_slot(slot, on_done)
   end)
 end
 
-function M.chat(prompt, on_chunk, on_done, history, opts)
-  if history and #history > 0 then
-    on_done(nil, "Branch conversations are not supported with the Pi backend yet")
-    return
-  end
-
-  local _, err = ensure_transport()
-  if err then
-    on_done(nil, err)
-    return
+function M.chat(prompt, on_chunk, on_done, opts)
+  local client = opts and opts.client
+  if not client then
+    local _, err = ensure_transport()
+    if err then
+      on_done(nil, err)
+      return
+    end
+    client = transport
   end
 
   local slot = M.resolve_slot(opts and opts.slot)
-  apply_slot(slot, function(ok, slot_err)
+  apply_slot(client, slot, function(ok, slot_err)
     if not ok then
       on_done(nil, slot_err)
       return
     end
 
-    transport.prompt(prompt, on_chunk, function(text, rpc_err)
-      sync_transport_state()
+    client.prompt(prompt, on_chunk, function(text, rpc_err)
+      if client == transport then
+        sync_transport_state()
+      end
       on_done(text, rpc_err)
     end)
+  end)
+end
+
+function M.fork(on_done)
+  local repo_root = M.get_repo_root() or vim.loop.cwd()
+  local opts = build_transport_opts(repo_root)
+  local source = M.get_session_file()
+  if M.config.pi.no_session or not source or vim.fn.filereadable(source) ~= 1 then
+    source = nil
+  end
+  opts.session_file = source
+
+  local client = transport.new()
+  local ok, err = client.ensure_started(opts)
+  if not ok then
+    on_done(nil, err)
+    return
+  end
+
+  if not source then
+    on_done(client, nil, nil)
+    return
+  end
+
+  client.clone_session(function(cloned, clone_err)
+    if not cloned then
+      client.stop()
+      on_done(nil, clone_err)
+      return
+    end
+    on_done(client, nil, source)
   end)
 end
 
@@ -572,10 +604,6 @@ function M.clone_session_from(session_file, on_done, parent_session)
       on_done(restart_err == nil, restart_err)
     end
   end)
-end
-
-function M.supports_branching()
-  return false
 end
 
 function M.stop()
