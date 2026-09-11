@@ -1,14 +1,14 @@
 local mentat = require("mentat")
 local prompt_loader = require("mentat.prompt_loader")
+local response_view = require("mentat.response")
+local model_picker = require("mentat.model_picker")
 
 local M = {}
 
 local bufnr = nil
-local ASSISTANT_NAME = "Pi"
 
--- Logging functions
-local function get_log_path()
-  local root = mentat.get_repo_root()
+local function get_log_path(root)
+  root = root or mentat.get_repo_root()
   if not root then return nil end
 
   local log_dir = root .. "/.mentat/logs"
@@ -18,8 +18,8 @@ local function get_log_path()
   return log_dir .. "/" .. date .. ".md"
 end
 
-local function log_to_file(text)
-  local path = get_log_path()
+local function log_to_file(text, root)
+  local path = get_log_path(root)
   if not path then return end
 
   local f = io.open(path, "a")
@@ -28,22 +28,15 @@ local function log_to_file(text)
   f:close()
 end
 
-local function assistant_heading(label)
-  if label then
-    return string.format("%s (%s)", ASSISTANT_NAME, label)
+local function log_conversation(prompt, response, err, metadata, root)
+  local body = response or ""
+  if err then
+    local label = metadata and metadata.status == "aborted" and "Aborted" or "Error"
+    body = body .. "\n\n**" .. label .. ":** " .. err
   end
-  return ASSISTANT_NAME
-end
-
-local function log_conversation(prompt, response, err, label)
-  local timestamp = os.date("%H:%M:%S")
-  local log = string.format("\n## %s\n\n### You\n\n%s\n\n### %s\n\n%s\n\n---\n",
-    timestamp,
-    prompt,
-    assistant_heading(label),
-    err and ("**Error:** " .. err) or response
-  )
-  log_to_file(log)
+  local log = string.format("\n## %s\n\n### You\n\n%s\n\n### %s\n\n%s\n\n%s\n\n---\n",
+    os.date("%H:%M:%S"), prompt, response_view.heading(metadata), body, response_view.timing(metadata))
+  log_to_file(log, root)
 end
 
 local function current_pid()
@@ -145,8 +138,11 @@ local function claim_instance(root, session_file)
 end
 
 local function get_or_create_buf()
-  if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+  if bufnr and vim.api.nvim_buf_is_loaded(bufnr) then
     return bufnr
+  end
+  if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+    vim.api.nvim_buf_delete(bufnr, { force = true })
   end
 
   bufnr = vim.api.nvim_create_buf(false, true)
@@ -154,6 +150,7 @@ local function get_or_create_buf()
   vim.bo[bufnr].filetype = "markdown"
   vim.bo[bufnr].buftype = "nofile"
   vim.bo[bufnr].modifiable = true
+  model_picker.attach(bufnr, mentat.get_client())
 
   -- Configure folding (must be done in window context)
   vim.api.nvim_create_autocmd("BufWinEnter", {
@@ -193,24 +190,23 @@ local function get_or_create_buf()
     if prompt == "" then
       return nil
     end
-    vim.api.nvim_buf_set_lines(bufnr, last_sep, -1, false, {})
-    return prompt
+    return prompt, last_sep
   end
 
   local function submit(slot)
-    local prompt = collect_input()
+    local prompt, draft_start = collect_input()
     if prompt then
-      M.send(prompt, slot)
+      M.send(prompt, slot, draft_start)
     end
   end
 
   vim.keymap.set("n", "<CR>", function()
-    submit("quick")
-  end, { buffer = bufnr, desc = "Send prompt (quick model)" })
+    submit()
+  end, { buffer = bufnr, desc = "Send with selected model and thinking" })
 
   vim.keymap.set("n", "<S-CR>", function()
     submit("big")
-  end, { buffer = bufnr, desc = "Send prompt (big model)" })
+  end, { buffer = bufnr, desc = "Use big for one request" })
 
   vim.keymap.set("n", "<leader>mp", function()
     M.promote()
@@ -357,25 +353,6 @@ local function append_lines(lines)
   scroll_to_bottom(buf)
 end
 
-local function append_chunk(text)
-  local buf = get_or_create_buf()
-
-  local last_line = vim.api.nvim_buf_line_count(buf)
-  local current = vim.api.nvim_buf_get_lines(buf, last_line - 1, last_line, false)[1] or ""
-
-  -- Preserve trailing empty lines so streamed markdown keeps its paragraph and code fence structure.
-  local lines = vim.split(text, "\n", { plain = true, trimempty = false })
-
-  if #lines == 0 then
-    return
-  end
-
-  -- first part appends to current line
-  lines[1] = current .. lines[1]
-  vim.api.nvim_buf_set_lines(buf, last_line - 1, last_line, false, lines)
-  scroll_to_bottom(buf)
-end
-
 local function find_mentat_win()
   if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
     return nil
@@ -388,18 +365,31 @@ local function find_mentat_win()
   return nil
 end
 
-function M.open()
+function M.target()
+  return model_picker.target(get_or_create_buf())
+end
+
+function M.open(opts)
   local buf = get_or_create_buf()
   local win = find_mentat_win()
   if not win then
     vim.cmd("vsplit")
     vim.api.nvim_win_set_buf(0, buf)
   end
+  model_picker.refresh()
+  if not (opts and opts.prepare == false) and not mentat.get_client().is_busy() then
+    mentat.prepare(function(ok, err)
+      if not ok and vim.api.nvim_buf_is_loaded(buf) then
+        vim.notify(err, vim.log.levels.ERROR)
+      end
+    end)
+  end
 end
 
 function M.close()
   local win = find_mentat_win()
   if win then
+    model_picker.invalidate(bufnr)
     vim.api.nvim_win_close(win, false)
   end
 end
@@ -590,22 +580,8 @@ local function build_hidden_tool_hint()
   return prompt_loader.read("runtime_hint.md") or ""
 end
 
-function M.send(prompt, slot)
-  M.open()
-  claim_instance(mentat.get_repo_root(), mentat.get_session_file())
-  M._last_prompt = prompt
-  local label = mentat.slot_label(mentat.resolve_slot(slot))
-  local prompt_lines = {}
-  for line in (prompt .. "\n"):gmatch("([^\n]*)\n") do
-    table.insert(prompt_lines, line)
-  end
-  local header = { "", "## You", "" }
-  local footer = { "", "---", "", "## " .. assistant_heading(label), "" }
-  vim.list_extend(header, prompt_lines)
-  vim.list_extend(header, footer)
-  append_lines(header)
-
-  -- Add invisible runtime guidance so Pi prefers editor-aware tools for "current file" requests.
+function M.send(prompt, slot, draft_start)
+  local root = mentat.get_repo_root()
   local actual_prompt = prompt_loader.render("runtime_user_request.md", {
     hint = build_hidden_tool_hint(),
     prompt = prompt,
@@ -646,23 +622,37 @@ function M.send(prompt, slot)
   end
 
   local full_response = ""
-
-  mentat.chat(actual_prompt,
+  local view
+  local accepted, err = mentat.chat(actual_prompt,
     function(chunk)
       full_response = full_response .. chunk
-      append_chunk(chunk)
+      view.chunk(chunk)
     end,
-    function(_, err)
-      claim_instance(mentat.get_repo_root(), mentat.get_session_file())
-      if err then
-        append_lines({ "", "**Error:** " .. err })
-      else
-        append_lines({ "", "", "---" })
-      end
-      log_conversation(prompt, full_response, err, label)
+    function(_, rpc_err, metadata)
+      claim_instance(root, mentat.get_session_file())
+      view.finish(metadata, rpc_err)
+      log_conversation(prompt, full_response, rpc_err, metadata, root)
     end,
-    { slot = slot }
+    {
+      slot = slot,
+      on_metadata = function(metadata)
+        view.metadata(metadata)
+      end,
+    }
   )
+  if not accepted then
+    vim.notify(err, vim.log.levels.WARN)
+    return false, err
+  end
+  M.open()
+  local buf = get_or_create_buf()
+  if draft_start then
+    vim.api.nvim_buf_set_lines(buf, draft_start, -1, false, {})
+  end
+  view = response_view.start(buf, prompt)
+  M._last_prompt = prompt
+  claim_instance(root, mentat.get_session_file())
+  return true
 end
 
 function M.promote()
@@ -674,12 +664,23 @@ function M.promote()
 end
 
 function M.clear()
-  mentat.clear()
-  M._contexts = {}
-  claim_instance(mentat.get_repo_root(), mentat.get_session_file())
-  if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
-    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "# Mentat Chat", "" })
+  local accepted, err = mentat.clear(function(ok, rpc_err, switched)
+    if ok or switched then
+      M._contexts = {}
+      M._last_prompt = nil
+      claim_instance(mentat.get_repo_root(), mentat.get_session_file())
+      if bufnr and vim.api.nvim_buf_is_loaded(bufnr) then
+        vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "# Mentat Chat", "" })
+      end
+    end
+    if not ok then
+      vim.notify(rpc_err, vim.log.levels.ERROR)
+    end
+  end)
+  if not accepted then
+    vim.notify(err, vim.log.levels.WARN)
   end
+  return accepted, err
 end
 
 local function restore_history_from_content(content)
@@ -793,6 +794,8 @@ function M.save_state()
   local state = {
     messages = mentat.messages,
     pi_session_file = session_file,
+    pi_selection = mentat.get_client().get_selection(),
+    pi_restore_selection = mentat.get_client().get_restore_selection(),
     contexts = M._contexts,
     buffer_content = content
   }
@@ -802,53 +805,69 @@ function M.save_state()
 end
 
 function M.load_state()
+  local client = mentat.get_client()
+  if client.is_busy() then
+    vim.notify("Pi is busy; wait before loading a session", vim.log.levels.WARN)
+    return
+  end
   local root = mentat.get_repo_root()
   if not root then return end
-  local state_file = root .. "/.mentat/state.json"
-  
-  local f = io.open(state_file, "r")
-  if not f then return end
-  local content = f:read("*a")
-  f:close()
-  
-  local ok, state = pcall(vim.json.decode, content)
-  if not ok or not state then return end
-  
-  local current_session_file = mentat.get_session_file()
-  local other_instances = other_active_instance_claims(root)
-  local reuse_saved_session = #other_instances == 0
-  mentat.messages = state.messages or {}
-  if reuse_saved_session then
-    mentat.session_file = state.pi_session_file or nil
-  elseif not current_session_file then
-    mentat.session_file = nil
-  end
-  M._contexts = state.contexts or {}
+  local state = read_json_file(root .. "/.mentat/state.json")
+  if type(state) ~= "table" then return end
 
-  if reuse_saved_session and state.pi_session_file and current_session_file and current_session_file ~= state.pi_session_file then
-    mentat.switch_session(state.pi_session_file)
+  local current = mentat.get_session_file()
+  local reuse = #other_active_instance_claims(root) == 0
+  local saved = type(state.pi_session_file) == "string" and state.pi_session_file or nil
+  local recovery = type(state.pi_restore_selection) == "table" and state.pi_restore_selection or nil
+  if not recovery and (not saved or vim.fn.filereadable(saved) ~= 1) and type(state.pi_selection) == "table" then
+    recovery = state.pi_selection
   end
 
-  claim_instance(root, mentat.get_session_file())
-  
-  if state.buffer_content and state.buffer_content ~= "" then
-     local buf = get_or_create_buf()
-     local lines = vim.split(state.buffer_content, "\n")
-     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-     scroll_to_bottom(buf)
-     -- Ensure window is open if we have content
-     if #lines > 1 then
-       M.open()
-     end
+  local function loaded(ok, err)
+    if not ok then
+      vim.notify("Could not load Mentat state: " .. tostring(err), vim.log.levels.ERROR)
+      return
+    end
+    mentat.messages = type(state.messages) == "table" and state.messages or {}
+    M._contexts = type(state.contexts) == "table" and state.contexts or {}
+    M._last_prompt = nil
+    claim_instance(root, mentat.get_session_file())
+    if type(state.buffer_content) == "string" and state.buffer_content ~= "" then
+      local buf = get_or_create_buf()
+      model_picker.invalidate(buf)
+      local lines = vim.split(state.buffer_content, "\n")
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+      scroll_to_bottom(buf)
+      if #lines > 1 then
+        M.open({ prepare = false })
+      end
+    end
   end
 
-  if not reuse_saved_session and state.pi_session_file then
-    vim.schedule(function()
-      vim.notify(
-        "Mentat opened a fresh Pi session because another Neovim instance is already active for this repo.",
-        vim.log.levels.INFO
-      )
-    end)
+  local function recover(ok, err)
+    if not ok then
+      loaded(false, err)
+    elseif reuse and recovery then
+      client.restore_settings(recovery)
+      mentat.prepare(loaded)
+    else
+      loaded(true)
+    end
+  end
+
+  if reuse and saved and current then
+    mentat.switch_session(saved, recover)
+  else
+    if reuse then
+      mentat.session_file = saved
+      if recovery then
+        client.restore_settings(recovery)
+      end
+    end
+    mentat.prepare(loaded)
+  end
+  if not reuse and saved then
+    vim.notify("Mentat is using a separate Pi session because another Neovim instance is active for this repo.", vim.log.levels.INFO)
   end
 end
 

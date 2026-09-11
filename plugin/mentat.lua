@@ -23,11 +23,24 @@ vim.api.nvim_create_user_command("Mentat", function(opts)
   else
     buf.send(opts.args, opts.bang and "big" or nil)
   end
-end, { nargs = "?", bang = true, desc = "Chat with Pi (! = big model)" })
+end, { nargs = "?", bang = true, desc = "Chat with Pi (! = big for one request)" })
+
+vim.api.nvim_create_user_command("MentatModel", function()
+  require("mentat.model_picker").pick("model")
+end, { desc = "Select this conversation's model" })
+
+vim.api.nvim_create_user_command("MentatThinking", function()
+  require("mentat.model_picker").pick("thinking")
+end, { desc = "Select this conversation's thinking level" })
+
+vim.keymap.set("n", "<leader>mm", "<Cmd>MentatModel<CR>", { desc = "Select Mentat model" })
+vim.keymap.set("n", "<leader>mr", "<Cmd>MentatThinking<CR>", { desc = "Select Mentat thinking level" })
 
 vim.api.nvim_create_user_command("MentatPromote", function()
-  require("mentat.buffer").promote()
-end, { desc = "Re-send last prompt to the big model" })
+  if not require("mentat.branch").promote() then
+    require("mentat.buffer").promote()
+  end
+end, { desc = "Re-send last prompt with big in the current conversation" })
 
 vim.api.nvim_create_user_command("MentatClear", function()
   require("mentat.buffer").clear()
@@ -104,7 +117,7 @@ vim.api.nvim_create_user_command("MentatSend", function(opts)
   if text ~= "" then
     buf.send(text, opts.bang and "big" or nil)
   end
-end, { range = true, bang = true, desc = "Send selected text to Pi (! = big model)" })
+end, { range = true, bang = true, desc = "Send selected text to Pi (! = big for one request)" })
 
 vim.keymap.set(
   "v",
@@ -171,5 +184,4 @@ end, { desc = "Save Mentat state to file" })
 
 vim.api.nvim_create_user_command("MentatLoadState", function()
   require("mentat.buffer").load_state()
-  vim.notify("Mentat state loaded", vim.log.levels.INFO)
 end, { desc = "Load Mentat state from file" })

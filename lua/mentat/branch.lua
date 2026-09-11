@@ -1,48 +1,16 @@
 local mentat = require("mentat")
 local prompt_loader = require("mentat.prompt_loader")
+local response_view = require("mentat.response")
+local model_picker = require("mentat.model_picker")
 
 local M = {}
-local ASSISTANT_NAME = "Pi"
+local branches = {}
 local STARTING_STATUS = "*Forking the main conversation...*"
-
-local function scroll_to_bottom(buf)
-  for _, win in ipairs(vim.api.nvim_list_wins()) do
-    if vim.api.nvim_win_get_buf(win) == buf then
-      vim.api.nvim_win_set_cursor(win, { vim.api.nvim_buf_line_count(buf), 0 })
-    end
-  end
-end
-
-local function append_lines(buf, lines)
-  if not vim.api.nvim_buf_is_loaded(buf) then
-    return
-  end
-  vim.api.nvim_buf_set_lines(buf, -1, -1, false, lines)
-  scroll_to_bottom(buf)
-end
-
-local function append_chunk(buf, text)
-  if not vim.api.nvim_buf_is_loaded(buf) then
-    return
-  end
-
-  local last_line = vim.api.nvim_buf_line_count(buf)
-  local current = vim.api.nvim_buf_get_lines(buf, last_line - 1, last_line, false)[1] or ""
-  local lines = vim.split(text, "\n", { plain = true, trimempty = false })
-  if #lines == 0 then
-    return
-  end
-
-  lines[1] = current .. lines[1]
-  vim.api.nvim_buf_set_lines(buf, last_line - 1, last_line, false, lines)
-  scroll_to_bottom(buf)
-end
 
 local function set_status(buf, text)
   if not vim.api.nvim_buf_is_loaded(buf) then
     return
   end
-
   local lines = vim.api.nvim_buf_get_lines(buf, 0, 5, false)
   for index, line in ipairs(lines) do
     if line == STARTING_STATUS then
@@ -52,74 +20,82 @@ local function set_status(buf, text)
   end
 end
 
-local function assistant_heading(label)
-  if label then
-    return string.format("%s (%s)", ASSISTANT_NAME, label)
-  end
-  return ASSISTANT_NAME
-end
-
 local function collect_input(buf)
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   local last_sep = 0
-  for i, line in ipairs(lines) do
-    if line:match("^%-%-%-$") then
-      last_sep = i
+  for index, line in ipairs(lines) do
+    if line == "---" then
+      last_sep = index
     end
   end
-
-  local prompt = table.concat(vim.list_slice(lines, last_sep + 1), "\n")
-  prompt = prompt:gsub("^%s+", ""):gsub("%s+$", "")
-  if prompt == "" then
-    return nil
+  local prompt = vim.trim(table.concat(vim.list_slice(lines, last_sep + 1), "\n"))
+  if prompt ~= "" then
+    return prompt, last_sep
   end
-
-  vim.api.nvim_buf_set_lines(buf, last_sep, -1, false, {})
-  return prompt
 end
 
-local function send(buf, client, prompt, slot)
-  local label = mentat.slot_label(mentat.resolve_slot(slot))
-  local lines = { "", "## You", "" }
-  vim.list_extend(lines, vim.split(prompt, "\n", { plain = true }))
-  vim.list_extend(lines, { "", "---", "", "## " .. assistant_heading(label), "" })
-  append_lines(buf, lines)
-
+local function send(branch, prompt, slot, draft_start)
+  if not branch.client then
+    vim.notify(branch.error or "The branch is still starting", vim.log.levels.WARN)
+    return false
+  end
   local actual_prompt = prompt_loader.render("runtime_user_request.md", {
     hint = prompt_loader.read("runtime_hint.md") or "",
     prompt = prompt,
   }) or prompt
-
-  mentat.chat(actual_prompt,
+  local view
+  local accepted, err = mentat.chat(actual_prompt,
     function(chunk)
-      append_chunk(buf, chunk)
+      view.chunk(chunk)
     end,
-    function(_, err)
-      if err then
-        append_lines(buf, { "", "**Error:** " .. err })
-      else
-        append_lines(buf, { "", "", "---" })
-      end
+    function(_, rpc_err, metadata)
+      view.finish(metadata, rpc_err)
     end,
-    { slot = slot, client = client }
+    {
+      slot = slot,
+      client = branch.client,
+      on_metadata = function(metadata)
+        view.metadata(metadata)
+      end,
+    }
   )
+  if not accepted then
+    vim.notify(err, vim.log.levels.WARN)
+    return false
+  end
+  if draft_start then
+    vim.api.nvim_buf_set_lines(branch.bufnr, draft_start, -1, false, {})
+  end
+  view = response_view.start(branch.bufnr, prompt)
+  branch.last_prompt = prompt
+  return true
+end
+
+function M.promote()
+  local branch = branches[vim.api.nvim_get_current_buf()]
+  if not branch then
+    return false
+  end
+  if not branch.last_prompt then
+    vim.notify("No prompt to promote yet", vim.log.levels.WARN)
+  else
+    send(branch, branch.last_prompt, "big")
+  end
+  return true
 end
 
 function M.open(initial_text)
   local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_name(buf, "Mentat Branch " .. os.date("%H:%M:%S"))
+  local branch = { bufnr = buf }
+  branches[buf] = branch
+  vim.api.nvim_buf_set_name(buf, "Mentat Branch " .. buf)
   vim.bo[buf].filetype = "markdown"
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].modifiable = true
-
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
-    "# Mentat Branch",
-    "",
-    STARTING_STATUS,
-    "",
-    "---",
-    "",
+    "# Mentat Branch", "", STARTING_STATUS, "", "---", "",
   })
+  model_picker.attach(buf, nil, "Mentat branch")
 
   vim.api.nvim_buf_call(buf, function()
     vim.cmd([[
@@ -130,79 +106,64 @@ function M.open(initial_text)
     ]])
   end)
 
-  require("mentat.buffer").open()
+  require("mentat.buffer").open({ prepare = false })
   vim.cmd("belowright vsplit")
   vim.api.nvim_win_set_buf(0, buf)
-
   if initial_text and initial_text ~= "" then
-    append_lines(buf, vim.split(initial_text, "\n", { plain = true }))
-    append_lines(buf, { "" })
+    vim.api.nvim_buf_set_lines(buf, -1, -1, false, vim.split(initial_text, "\n", { plain = true }))
   end
-  scroll_to_bottom(buf)
-
-  local client = nil
-  local start_err = nil
+  vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(buf), 0 })
+  model_picker.refresh()
 
   local function submit(slot)
-    if start_err then
-      vim.notify("The branch failed to start: " .. start_err, vim.log.levels.ERROR)
-      return
-    end
-    if not client then
-      vim.notify("The branch is still starting", vim.log.levels.WARN)
-      return
-    end
-
-    local prompt = collect_input(buf)
+    local prompt, draft_start = collect_input(buf)
     if prompt then
-      send(buf, client, prompt, slot)
+      send(branch, prompt, slot, draft_start)
     end
   end
-
   vim.keymap.set("n", "<CR>", function()
-    submit("quick")
-  end, { buffer = buf, desc = "Send prompt (quick model)" })
-
+    submit()
+  end, { buffer = buf, desc = "Send with selected model and thinking" })
   vim.keymap.set("n", "<S-CR>", function()
     submit("big")
-  end, { buffer = buf, desc = "Send prompt (big model)" })
-
+  end, { buffer = buf, desc = "Use big for one request" })
+  vim.keymap.set("n", "<leader>mp", M.promote, { buffer = buf, desc = "Re-send last prompt with big in this branch" })
   vim.keymap.set("n", "q", function()
     vim.api.nvim_buf_delete(buf, { force = true })
   end, { buffer = buf, desc = "Close branch" })
-
   vim.api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {
     buffer = buf,
     callback = function()
-      if client then
-        client.stop()
-        client = nil
+      branches[buf] = nil
+      if branch.cancel then
+        branch.cancel()
       end
     end,
   })
 
-  mentat.fork(function(forked, err, source)
-    if not forked then
-      start_err = tostring(err)
-      set_status(buf, "**Error:** could not fork the conversation: " .. start_err)
-      return
-    end
-
+  branch.cancel = mentat.fork(function(client, err, source)
     if not vim.api.nvim_buf_is_loaded(buf) then
-      forked.stop()
+      if client then
+        client.stop()
+      end
       return
     end
-
-    client = forked
+    if not client then
+      branch.error = "Could not fork the conversation: " .. tostring(err)
+      set_status(buf, "**Error:** " .. branch.error)
+      return
+    end
+    branch.client = client
+    model_picker.attach(buf, client, "Mentat branch")
     if source then
       set_status(buf, string.format(
         "*Forked from the main conversation (%d messages). Type a question and press Enter.*",
-        client.state.message_count or 0
-      ))
+        client.state.message_count or 0))
     else
-      set_status(buf, "*Started a fresh session (the main conversation has not been saved yet). Type a question and press Enter.*")
+      set_status(buf, "*Started with the main conversation's settings (no saved history yet). Type a question and press Enter.*")
     end
   end)
+  return buf
 end
 
 return M

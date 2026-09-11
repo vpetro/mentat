@@ -1,6 +1,7 @@
 local transport = require("mentat.transports.pi_rpc")
 local editor_bridge = require("mentat.editor_bridge")
 local prompt_loader = require("mentat.prompt_loader")
+local models = require("mentat.models")
 
 local M = {}
 
@@ -78,7 +79,7 @@ end
 
 function M.capture_repo_root(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
-  if not vim.api.nvim_buf_is_valid(bufnr) then
+  if not vim.api.nvim_buf_is_valid(bufnr) or vim.bo[bufnr].buftype ~= "" then
     return M.repo_root
   end
 
@@ -301,8 +302,12 @@ local function prepare_system_prompt_file(repo_root)
 end
 
 local function sync_transport_state()
-  M.session_file = transport.state.session_file or M.session_file
+  if transport.state.ready then
+    M.session_file = transport.state.session_file
+  end
 end
+
+transport.subscribe(sync_transport_state)
 
 local function build_transport_opts(repo_root)
   local prompt_path = prepare_system_prompt_file(repo_root)
@@ -338,9 +343,7 @@ local function build_transport_opts(repo_root)
   return {
     repo_root = repo_root,
     cmd = M.config.pi.cmd,
-    provider = M.config.provider,
-    model = M.config.model,
-    thinking = M.config.thinking,
+    default_selection = models.defaults(M.config),
     offline = M.config.pi.offline,
     no_session = M.config.pi.no_session,
     agent_dir = M.config.pi.agent_dir,
@@ -360,23 +363,16 @@ local function build_transport_opts(repo_root)
     append_system_prompt = prompt_path,
     env = bridge_env,
     extra_args = M.config.pi.extra_args,
+    rpc_timeout_ms = M.config.pi.rpc_timeout_ms,
     prompt_asset_signatures = build_prompt_asset_signatures(prompt_asset_paths),
   }
 end
 
-local function ensure_transport(overrides)
-  local repo_root = M.get_repo_root() or vim.loop.cwd()
-  local opts = build_transport_opts(repo_root)
-  if overrides then
-    opts = vim.tbl_deep_extend("force", opts, overrides)
+local function start_config()
+  local root = M.get_repo_root() or vim.loop.cwd()
+  return function()
+    return build_transport_opts(root)
   end
-  local ok, err = transport.ensure_started(opts)
-  if not ok then
-    return nil, err
-  end
-
-  sync_transport_state()
-  return repo_root
 end
 
 function M.setup(opts)
@@ -385,24 +381,25 @@ function M.setup(opts)
   transport.stop()
 end
 
-function M.clear()
-  M.messages = {}
+function M.get_client()
+  return transport
+end
 
-  local _, err = ensure_transport()
-  if err then
-    M.session_file = nil
-    return
-  end
+function M.prepare(on_done)
+  return transport.ensure_started(start_config(), on_done)
+end
 
-  transport.new_session(function(ok, rpc_err)
-    if ok then
-      sync_transport_state()
-    else
-      vim.schedule(function()
-        vim.notify("Failed to start a new Pi session: " .. tostring(rpc_err), vim.log.levels.ERROR)
-      end)
+function M.clear(on_done)
+  local previous = transport.state.session_id
+  return transport.new_session(function(ok, err)
+    local switched = previous ~= transport.state.session_id
+    if ok or switched then
+      M.messages = {}
     end
-  end)
+    if on_done then
+      on_done(ok, err, switched)
+    end
+  end, start_config())
 end
 
 function M.resolve_slot(name)
@@ -425,103 +422,97 @@ function M.slot_label(slot)
   return id
 end
 
-local function split_slot_model(slot)
-  local provider, id = (slot.model or ""):match("^([^/]+)/(.+)$")
-  if provider then
-    return provider, id
-  end
-  return slot.provider or M.config.provider, slot.model
-end
-
-local function apply_slot(client, slot, on_done)
-  if not slot or not slot.model then
-    on_done(true, nil)
-    return
-  end
-
-  local provider, model_id = split_slot_model(slot)
-  if not provider then
-    on_done(false, "Slot needs a provider: set slot.provider, config.provider, or use provider/model")
-    return
-  end
-
-  client.set_model(provider, model_id, function(ok, err)
-    if not ok then
-      on_done(false, string.format("Failed to switch model to %s: %s", model_id, tostring(err)))
-      return
-    end
-
-    if not slot.thinking then
-      on_done(true, nil)
-      return
-    end
-
-    client.set_thinking_level(slot.thinking, function(thinking_ok, thinking_err)
-      if not thinking_ok then
-        on_done(false, "Failed to set thinking level: " .. tostring(thinking_err))
-        return
-      end
-      on_done(true, nil)
-    end)
-  end)
-end
-
 function M.chat(prompt, on_chunk, on_done, opts)
-  local client = opts and opts.client
-  if not client then
-    local _, err = ensure_transport()
-    if err then
-      on_done(nil, err)
-      return
-    end
-    client = transport
+  opts = opts or {}
+  local client = opts.client or transport
+  if client.is_busy() then
+    return false, "Pi is busy; wait for the current operation to settle"
   end
-
-  local slot = M.resolve_slot(opts and opts.slot)
-  apply_slot(client, slot, function(ok, slot_err)
-    if not ok then
-      on_done(nil, slot_err)
-      return
+  local override
+  if opts.slot then
+    local err
+    override, err = models.preset(M.config, opts.slot)
+    if not override then
+      return false, err
     end
-
-    client.prompt(prompt, on_chunk, function(text, rpc_err)
-      if client == transport then
-        sync_transport_state()
-      end
-      on_done(text, rpc_err)
-    end)
-  end)
+  end
+  return client.prompt(prompt, on_chunk, on_done, {
+    start_config = client == transport and start_config() or nil,
+    override = override,
+    on_metadata = opts.on_metadata,
+  })
 end
 
 function M.fork(on_done)
-  local repo_root = M.get_repo_root() or vim.loop.cwd()
-  local opts = build_transport_opts(repo_root)
-  local source = M.get_session_file()
-  if M.config.pi.no_session or not source or vim.fn.filereadable(source) ~= 1 then
-    source = nil
-  end
-  opts.session_file = source
-
-  local client = transport.new()
-  local ok, err = client.ensure_started(opts)
-  if not ok then
-    on_done(nil, err)
-    return
-  end
-
-  if not source then
-    on_done(client, nil, nil)
-    return
-  end
-
-  client.clone_session(function(cloned, clone_err)
-    if not cloned then
-      client.stop()
-      on_done(nil, clone_err)
+  local root = M.get_repo_root() or vim.loop.cwd()
+  local client
+  local cancelled = false
+  local completed = false
+  local function complete(forked, err, source)
+    if completed or cancelled then
       return
     end
-    on_done(client, nil, source)
+    completed = true
+    if not forked and client then
+      client.stop()
+    end
+    on_done(forked, err, source)
+  end
+  local accepted, err = M.prepare(function(ok, prepare_err)
+    if cancelled then
+      return
+    end
+    if not ok then
+      complete(nil, prepare_err)
+      return
+    end
+    local inherited = transport.get_selection()
+    local source = M.get_session_file()
+    if M.config.pi.no_session or type(source) ~= "string" or vim.fn.filereadable(source) ~= 1 then
+      source = nil
+    end
+    local opts = build_transport_opts(root)
+    opts.session_file = source
+    opts.default_selection = inherited
+    client = transport.new()
+    client.ensure_started(opts, function(started, start_err)
+      if cancelled then
+        return
+      end
+      if not started then
+        complete(nil, start_err)
+        return
+      end
+      local function inherit(cloned, clone_err)
+        if cancelled then
+          return
+        end
+        if not cloned then
+          complete(nil, clone_err)
+          return
+        end
+        client.set_selection(inherited, function(selected, selection_err)
+          complete(selected and client or nil, selection_err, source)
+        end)
+      end
+      if source then
+        client.clone_session(inherit)
+      else
+        inherit(true)
+      end
+    end)
   end)
+  if not accepted then
+    vim.schedule(function()
+      complete(nil, err)
+    end)
+  end
+  return function()
+    cancelled = true
+    if client then
+      client.stop("Mentat branch closed")
+    end
+  end
 end
 
 function M.get_session_file()
@@ -529,81 +520,24 @@ function M.get_session_file()
 end
 
 function M.switch_session(session_file, on_done)
-  M.session_file = session_file
-
-  local _, err = ensure_transport()
-  if err then
-    if on_done then
-      on_done(false, err)
-    end
-    return
+  local accepted, err = transport.switch_session(session_file, on_done, start_config())
+  if not accepted and on_done then
+    on_done(false, err)
   end
-
-  transport.switch_session(session_file, function(ok, rpc_err)
-    if ok then
-      sync_transport_state()
-    end
-    if on_done then
-      on_done(ok, rpc_err)
-    end
-  end)
+  return accepted, err
 end
 
 function M.clone_session_from(session_file, on_done, parent_session)
-  local previous_session = M.get_session_file()
-  transport.stop()
-  transport.state.session_file = session_file
-  M.session_file = session_file
-
-  local _, err = ensure_transport({
-    no_extensions = true,
-    no_skills = true,
-    no_prompt_templates = true,
-    no_themes = true,
+  local accepted, err = transport.clone_from(session_file, on_done, {
+    start_config = start_config(),
+    prepare_clone = function(path)
+      return set_parent_session(path, parent_session)
+    end,
   })
-  if err then
-    transport.state.session_file = previous_session
-    M.session_file = previous_session
-    if on_done then
-      on_done(false, err)
-    end
-    return
+  if not accepted and on_done then
+    on_done(false, err)
   end
-
-  transport.clone_session(function(ok, rpc_err)
-    if not ok then
-      transport.stop()
-      transport.state.session_file = previous_session
-      M.session_file = previous_session
-      if on_done then
-        on_done(false, rpc_err)
-      end
-      return
-    end
-
-    sync_transport_state()
-    local cloned_session = M.get_session_file()
-    transport.stop()
-
-    local parent_err = set_parent_session(cloned_session, parent_session)
-    if parent_err then
-      vim.fn.delete(cloned_session)
-      transport.state.session_file = previous_session
-      M.session_file = previous_session
-      if on_done then
-        on_done(false, parent_err)
-      end
-      return
-    end
-
-    transport.state.session_file = cloned_session
-    M.session_file = cloned_session
-
-    local _, restart_err = ensure_transport()
-    if on_done then
-      on_done(restart_err == nil, restart_err)
-    end
-  end)
+  return accepted, err
 end
 
 function M.stop()
