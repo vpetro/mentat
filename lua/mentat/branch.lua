@@ -51,13 +51,7 @@ local function send(branch, prompt, slot, draft_start)
     function(_, rpc_err, metadata)
       view.finish(metadata, rpc_err)
     end,
-    {
-      slot = slot,
-      client = branch.client,
-      on_metadata = function(metadata)
-        view.metadata(metadata)
-      end,
-    }
+    { slot = slot, client = branch.client }
   )
   if not accepted then
     vim.notify(err, vim.log.levels.WARN)

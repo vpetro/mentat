@@ -12,7 +12,7 @@ local function duration(ms)
   return string.format("%.2fs", ms / 1000)
 end
 
-function M.heading(metadata)
+function M.log_heading(metadata)
   local labels = {}
   for _, selection in ipairs(metadata and metadata.models or {}) do
     table.insert(labels, models.label(selection))
@@ -22,13 +22,15 @@ end
 
 function M.timing(metadata)
   metadata = metadata or {}
-  return string.format("*First text: %s | Total: %s | Status: %s*",
-    duration(metadata.first_text_ms), duration(metadata.total_ms), metadata.status or "error")
+  local status = metadata.status or "error"
+  local label = status == "complete" and "Status" or "Status: " .. status
+  return string.format("[%s - First text: %s | Total: %s]",
+    label, duration(metadata.first_text_ms), duration(metadata.total_ms))
 end
 
 function M.body(text, metadata, err)
   text = text or ""
-  local stamp_pattern = "(%[%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d[^\r\n%]]*%])[ \t\r\n]*$"
+  local stamp_pattern = "%[(%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d)[^\r\n%]]*%][ \t\r\n]*$"
   local body, stamp = text:match("^(.-)\n+" .. stamp_pattern)
   if not body then
     stamp = text:match("^" .. stamp_pattern)
@@ -43,10 +45,11 @@ function M.body(text, metadata, err)
     local label = metadata and metadata.status == "aborted" and "Aborted" or "Error"
     table.insert(parts, "**" .. label .. ":** " .. err)
   end
-  table.insert(parts, M.timing(metadata))
+  local footer = M.timing(metadata)
   if stamp then
-    table.insert(parts, stamp)
+    footer = footer .. " - [" .. stamp .. "]"
   end
+  table.insert(parts, footer)
   return table.concat(parts, "\n\n")
 end
 
@@ -55,8 +58,8 @@ function M.start(buf, prompt)
   local closed = false
   local lines = { "", "## You", "" }
   vim.list_extend(lines, vim.split(prompt, "\n", { plain = true }))
-  vim.list_extend(lines, { "", "---", "", "## Pi", "", "", "---", "" })
-  local heading_row = vim.api.nvim_buf_line_count(buf) + #lines - 5
+  vim.list_extend(lines, { "", "---", "", "## Pi", "", "---", "" })
+  local heading_row = vim.api.nvim_buf_line_count(buf) + #lines - 4
   vim.api.nvim_buf_set_lines(buf, -1, -1, false, lines)
   local mark = vim.api.nvim_buf_set_extmark(buf, namespace, heading_row, 0, { right_gravity = false })
   local output = vim.api.nvim_buf_set_extmark(buf, namespace, heading_row + 1, 0, { right_gravity = false })
@@ -70,17 +73,6 @@ function M.start(buf, prompt)
       if vim.api.nvim_win_get_buf(win) == buf then
         vim.api.nvim_win_set_cursor(win, { vim.api.nvim_buf_line_count(buf), 0 })
       end
-    end
-  end
-
-  function response.metadata(metadata)
-    if not valid() then
-      return
-    end
-    local pos = vim.api.nvim_buf_get_extmark_by_id(buf, namespace, mark, {})
-    if #pos > 0 then
-      local line = vim.api.nvim_buf_get_lines(buf, pos[1], pos[1] + 1, false)[1]
-      vim.api.nvim_buf_set_text(buf, pos[1], 0, pos[1], #line, { "## " .. M.heading(metadata) })
     end
   end
 
@@ -104,7 +96,6 @@ function M.start(buf, prompt)
     if not valid() then
       return
     end
-    response.metadata(metadata)
     local first = vim.api.nvim_buf_get_extmark_by_id(buf, namespace, mark, {})
     local last = vim.api.nvim_buf_get_extmark_by_id(buf, namespace, output, {})
     if #first > 0 and #last > 0 then

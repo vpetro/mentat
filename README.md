@@ -43,13 +43,23 @@ Without an explicit model, Mentat uses `default_slot` (normally `quick`) when co
 
 ## Response metadata
 
-Each response heading reports the provider/model and effective thinking level observed for its assistant messages. The model appears only in that header, not in a response footer. Mentat does not label a response with an unconfirmed preset before the request starts.
+Conversation responses use a plain `## Pi` heading. The winbar shows the selected model and thinking level. Main-conversation log headings retain the model/thinking observed for the response, including one-shot overrides.
 
 - First text measures elapsed time from submission to the first non-whitespace assistant text. Tool summaries and thinking events do not count. It is `n/a` when no assistant text arrives.
 - Total measures submission through `agent_settled`, including tools, retries, and compaction. If a request fails before settlement, it ends at that failure. Restoring a one-shot override can keep the client busy after the measured request has settled.
 - Status distinguishes completion, errors, and aborts. Main-conversation logs under `.mentat/logs/YYYY-MM-DD.md` include this metadata and any partial output.
 
-If Pi appends a response timestamp, timing and any error appear before it. The timestamp is the final line of the response in both the chat and its log.
+Timing and Pi's trailing timestamp share one compact footer line. The timestamp shows only the date and time, and the separator follows immediately:
+
+```markdown
+## Pi
+Response text.
+
+[Status - First text: 1.64s | Total: 3.25s] - [2026-09-12 03:07:57]
+---
+```
+
+Errors and aborted requests use `Status: error` or `Status: aborted`; the reason appears above the footer. When Pi supplies no timestamp, the footer contains timing only.
 
 Mentat's saved state includes recovery settings for an interrupted one-shot override. Branch transcripts are not included in the main conversation's saved UI state or daily log.
 

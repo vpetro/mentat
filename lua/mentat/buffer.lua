@@ -29,8 +29,8 @@ local function log_to_file(text, root)
 end
 
 local function log_conversation(prompt, response, err, metadata, root)
-  local log = string.format("\n## %s\n\n### You\n\n%s\n\n### %s\n\n%s\n\n---\n",
-    os.date("%H:%M:%S"), prompt, response_view.heading(metadata), response_view.body(response, metadata, err))
+  local log = string.format("\n## %s\n\n### You\n\n%s\n\n### %s\n\n%s\n---\n",
+    os.date("%H:%M:%S"), prompt, response_view.log_heading(metadata), response_view.body(response, metadata, err))
   log_to_file(log, root)
 end
 
@@ -628,12 +628,7 @@ function M.send(prompt, slot, draft_start)
       view.finish(metadata, rpc_err)
       log_conversation(prompt, full_response, rpc_err, metadata, root)
     end,
-    {
-      slot = slot,
-      on_metadata = function(metadata)
-        view.metadata(metadata)
-      end,
-    }
+    { slot = slot }
   )
   if not accepted then
     vim.notify(err, vim.log.levels.WARN)
