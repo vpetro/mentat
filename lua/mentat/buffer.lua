@@ -29,13 +29,8 @@ local function log_to_file(text, root)
 end
 
 local function log_conversation(prompt, response, err, metadata, root)
-  local body = response or ""
-  if err then
-    local label = metadata and metadata.status == "aborted" and "Aborted" or "Error"
-    body = body .. "\n\n**" .. label .. ":** " .. err
-  end
-  local log = string.format("\n## %s\n\n### You\n\n%s\n\n### %s\n\n%s\n\n%s\n\n---\n",
-    os.date("%H:%M:%S"), prompt, response_view.heading(metadata), body, response_view.timing(metadata))
+  local log = string.format("\n## %s\n\n### You\n\n%s\n\n### %s\n\n%s\n\n---\n",
+    os.date("%H:%M:%S"), prompt, response_view.heading(metadata), response_view.body(response, metadata, err))
   log_to_file(log, root)
 end
 

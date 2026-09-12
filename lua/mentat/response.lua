@@ -26,6 +26,30 @@ function M.timing(metadata)
     duration(metadata.first_text_ms), duration(metadata.total_ms), metadata.status or "error")
 end
 
+function M.body(text, metadata, err)
+  text = text or ""
+  local stamp_pattern = "(%[%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d[^\r\n%]]*%])[ \t\r\n]*$"
+  local body, stamp = text:match("^(.-)\n+" .. stamp_pattern)
+  if not body then
+    stamp = text:match("^" .. stamp_pattern)
+    body = stamp and "" or text
+  end
+  local parts = {}
+  body = body:gsub("%s+$", "")
+  if body ~= "" then
+    table.insert(parts, body)
+  end
+  if err then
+    local label = metadata and metadata.status == "aborted" and "Aborted" or "Error"
+    table.insert(parts, "**" .. label .. ":** " .. err)
+  end
+  table.insert(parts, M.timing(metadata))
+  if stamp then
+    table.insert(parts, stamp)
+  end
+  return table.concat(parts, "\n\n")
+end
+
 function M.start(buf, prompt)
   local response = {}
   local closed = false
@@ -55,8 +79,8 @@ function M.start(buf, prompt)
     end
     local pos = vim.api.nvim_buf_get_extmark_by_id(buf, namespace, mark, {})
     if #pos > 0 then
-      vim.api.nvim_buf_set_lines(buf, pos[1], pos[1] + 1, false, { "## " .. M.heading(metadata) })
-      vim.api.nvim_buf_set_extmark(buf, namespace, pos[1], 0, { id = mark, right_gravity = false })
+      local line = vim.api.nvim_buf_get_lines(buf, pos[1], pos[1] + 1, false)[1]
+      vim.api.nvim_buf_set_text(buf, pos[1], 0, pos[1], #line, { "## " .. M.heading(metadata) })
     end
   end
 
@@ -81,13 +105,14 @@ function M.start(buf, prompt)
       return
     end
     response.metadata(metadata)
-    local ending = "\n\n"
-    if err then
-      local label = metadata and metadata.status == "aborted" and "Aborted" or "Error"
-      ending = ending .. "**" .. label .. ":** " .. err .. "\n\n"
+    local first = vim.api.nvim_buf_get_extmark_by_id(buf, namespace, mark, {})
+    local last = vim.api.nvim_buf_get_extmark_by_id(buf, namespace, output, {})
+    if #first > 0 and #last > 0 then
+      local body = table.concat(vim.api.nvim_buf_get_text(buf, first[1] + 1, 0, last[1], last[2], {}), "\n")
+      local lines = vim.split(M.body(body, metadata, err), "\n", { plain = true })
+      vim.api.nvim_buf_set_text(buf, first[1] + 1, 0, last[1], last[2], lines)
+      scroll()
     end
-    ending = ending .. M.timing(metadata) .. "\n"
-    response.chunk(ending)
     closed = true
     vim.api.nvim_buf_del_extmark(buf, namespace, mark)
     vim.api.nvim_buf_del_extmark(buf, namespace, output)

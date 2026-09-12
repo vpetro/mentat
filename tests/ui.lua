@@ -65,6 +65,88 @@ return function(test, eq, contains)
     contains(vim.wo.winbar, "openai/reasoner; thinking medium")
   end)
 
+  test("response headers stay above streamed text without a repeated model footer", function(f)
+    local _, _, buf = opened(f)
+    f.draft(buf, "question")
+    f.press(buf, "<CR>")
+    f.wait(function() return #f.sent == 1 end)
+    f.start_message(1)
+    f.text(1, "First line.")
+    f.flush()
+    local text = f.content(buf)
+    local header = assert(text:find("## Pi (", 1, true))
+    local body = assert(text:find("First line.", 1, true))
+    assert(header < body)
+    f.text(1, "\n\nSecond line.")
+    f.finish(1, "First line.\n\nSecond line.")
+    f.flush()
+    text = f.content(buf)
+    contains(text, "First line.\n\nSecond line.")
+    local _, headers = text:gsub("## Pi %(", "")
+    eq(headers, 1)
+    assert(text:find("## Pi (", 1, true) < text:find("First line.", 1, true))
+  end)
+
+  test("timing precedes the final timestamp in the main response and log without changing the draft", function(f)
+    local _, _, buf = opened(f)
+    local body = "First line.\n\nSecond line."
+    local stamp = "[2026-09-12 02:57:52 Sat EDT (UTC-04:00)]"
+    f.draft(buf, "question")
+    f.press(buf, "<CR>")
+    f.wait(function() return #f.sent == 1 end)
+    f.start_message(1)
+    f.text(1, body)
+    f.flush()
+    f.draft(buf, "next draft")
+    f.finish(1, body .. "\n\n" .. stamp)
+    f.flush()
+    local text = f.content(buf)
+    local timing = assert(text:find("*First text:", 1, true))
+    local timestamp, last = text:find(stamp, 1, true)
+    assert(timestamp and timing < timestamp)
+    contains(text, body)
+    assert(text:sub(last + 1):match("^%s*%-%-%-%s*next draft$"))
+    local log = table.concat(vim.fn.readfile(f.root .. "/.mentat/logs/" .. os.date("%Y-%m-%d") .. ".md"), "\n")
+    assert(log:find("*First text:", 1, true) < log:find(stamp, 1, true))
+    assert(log:sub(select(2, log:find(stamp, 1, true)) + 1):match("^%s*%-%-%-%s*$"))
+  end)
+
+  test("response formatting keeps errors before timestamps and leaves other date text alone", function()
+    local response = require("mentat.response")
+    local stamp = "[2026-09-12 02:57:52 Sat EDT (UTC-04:00)]"
+    for _, status in ipairs({ "error", "aborted" }) do
+      local metadata = { first_text_ms = 125, total_ms = 3000, status = status }
+      local label = status == "aborted" and "Aborted" or "Error"
+      eq(response.body("Partial text.\n\n" .. stamp .. "\n\n", metadata, "Stopped"),
+        "Partial text.\n\n**" .. label .. ":** Stopped\n\n" .. response.timing(metadata) .. "\n\n" .. stamp)
+    end
+    local metadata = { total_ms = 3000, status = "complete" }
+    eq(response.body(stamp, metadata), response.timing(metadata) .. "\n\n" .. stamp)
+    for _, body in ipairs({ "No timestamp.", "Discuss " .. stamp, "```\n" .. stamp .. "\n```" }) do
+      eq(response.body(body, metadata), body .. "\n\n" .. response.timing(metadata))
+    end
+  end)
+
+  test("branch responses keep one header and put timing before a streamed timestamp", function(f)
+    opened(f)
+    local buf = require("mentat.branch").open("branch question")
+    local picker = require("mentat.model_picker")
+    f.wait(function()
+      local target = picker.target(buf)
+      return target.client and not target.client.is_busy()
+    end)
+    f.press(buf, "<CR>")
+    f.wait(function() return #f.sent == 1 end)
+    local stamp = "[2026-09-12 02:57:52 Sat EDT (UTC-04:00)]"
+    f.complete(2, "Branch answer.\n\n" .. stamp)
+    local text = f.content(buf)
+    contains(text, "Branch answer.")
+    local _, headers = text:gsub("## Pi %(", "")
+    eq(headers, 1)
+    assert(text:find("*First text:", 1, true) < text:find(stamp, 1, true))
+    assert(text:sub(select(2, text:find(stamp, 1, true)) + 1):match("^%s*%-%-%-%s*$"))
+  end)
+
   test("Shift-Enter, bang, and Promote use big only for their own request", function(f)
     local mentat, buffer, buf = opened(f)
     f.draft(buf, "use big once")
