@@ -1,4 +1,9 @@
+local boundary = require("mentat.async")
+local fs = require("mentat.fs")
+local async = vim.async
 local M = {}
+local owners = {}
+local group = vim.api.nvim_create_augroup("MentatReview", { clear = true })
 
 local function notify(message, level)
   vim.schedule(function()
@@ -61,18 +66,17 @@ local function locate(bufnr)
 end
 
 local function branch_snapshot(path, target_id)
-  local file, open_err = io.open(path, "r")
-  if not file then
-    return nil, open_err
+  local lines, read_err = fs.read_lines(path)
+  if not lines then
+    return nil, read_err
   end
 
   local header
   local entries = {}
   local last_id
-  for line in file:lines() do
+  for _, line in ipairs(lines) do
     local ok, entry = pcall(vim.json.decode, line)
     if not ok or type(entry) ~= "table" then
-      file:close()
       return nil, "Invalid JSON in the originating Pi session"
     end
     if entry.type == "session" then
@@ -84,11 +88,9 @@ local function branch_snapshot(path, target_id)
         break
       end
     else
-      file:close()
       return nil, "The originating Pi session contains an entry without an ID"
     end
   end
-  file:close()
 
   if not header then
     return nil, "The originating Pi session has no header"
@@ -123,19 +125,11 @@ local function branch_snapshot(path, target_id)
     entry_id = parent_id
   end
 
-  local snapshot = vim.fn.tempname() .. ".jsonl"
-  local output, write_err = io.open(snapshot, "w")
-  if not output then
-    return nil, write_err
-  end
-  output:write(header, "\n")
+  local snapshot = { header }
   for index = #reverse, 1, -1 do
-    output:write(reverse[index], "\n")
+    snapshot[#snapshot + 1] = reverse[index]
   end
-  output:close()
-  local uv = vim.uv or vim.loop
-  uv.fs_chmod(snapshot, 384)
-  return snapshot, nil
+  return table.concat(snapshot, "\n") .. "\n"
 end
 
 local function report_switch(ok, err, label)
@@ -159,44 +153,83 @@ function M.load(opts)
   end
 
   local mentat = require("mentat")
+  local owner = owners[bufnr]
+  if not owner then
+    owner = {}
+    owners[bufnr] = owner
+    vim.api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {
+      group = group,
+      buffer = bufnr,
+      callback = function()
+        owners[bufnr] = nil
+        if owner.task then
+          owner.task:close()
+        end
+      end,
+    })
+  elseif owner.task then
+    owner.task:close()
+  end
+  local root = mentat.get_repo_root() or vim.uv.cwd()
+  local client = mentat.get_client()
+  local revision = client.state.revision
+  local tick = vim.api.nvim_buf_get_changedtick(bufnr)
   local cached = vim.b[bufnr].mentat_review_session
-  if not opts.force and type(cached) == "string" and vim.fn.filereadable(cached) == 1 then
-    mentat.switch_session(cached, function(ok, switch_err)
-      report_switch(ok, switch_err, "the review session")
-    end)
-    return
-  end
-
   local source = vim.fn.fnamemodify(context.session_file, ":p")
-  local target_id = opts.force and nil or context.leaf_id
-  local snapshot, snapshot_err = branch_snapshot(source, target_id)
-  if not snapshot then
-    notify("Could not read the originating Pi session: " .. tostring(snapshot_err), vim.log.levels.ERROR)
-    return
+  local target_id = not opts.force and context.leaf_id or nil
+  local label = "a fork of " .. (context.session_name or context.session_id or "the Pi review context")
+  local function valid()
+    return owners[bufnr] == owner and vim.api.nvim_buf_is_loaded(bufnr) and vim.api.nvim_buf_get_changedtick(bufnr) == tick
   end
-
-  mentat.clone_session_from(snapshot, function(cloned, clone_err)
-    vim.fn.delete(snapshot)
-    if not cloned then
-      report_switch(false, clone_err, "")
-      return
+  local task = async.run("mentat review context", function()
+    async.await(vim.schedule)
+    if not valid() or revision ~= client.state.revision then
+      return false, "The conversation or review buffer changed; load the context again"
     end
-
-    local session_file = mentat.get_session_file()
-    if type(session_file) ~= "string" or session_file == "" or session_file == snapshot then
-      report_switch(false, "Pi did not create a separate review session", "")
-      return
+    if not opts.force and type(cached) == "string" and vim.fn.filereadable(cached) == 1 then
+      label = "the review session"
+      return boundary.call(function(done)
+        return mentat.switch_session(cached, done, root)
+      end)
     end
-
-    vim.schedule(function()
-      if vim.api.nvim_buf_is_valid(bufnr) then
-        vim.b[bufnr].mentat_review_session = session_file
+    local snapshot, snapshot_err = branch_snapshot(source, target_id)
+    if not snapshot then
+      return false, "Could not read the originating Pi session: " .. tostring(snapshot_err)
+    end
+    if not valid() or revision ~= client.state.revision then
+      return false, "The conversation or review buffer changed; load the context again"
+    end
+    return fs.with_temp(snapshot, function(path)
+      if not valid() or revision ~= client.state.revision then
+        return false, "The conversation or review buffer changed; load the context again"
       end
+      local cloned, clone_err = boundary.call(function(done)
+        return mentat.clone_session_from(path, done, source, root)
+      end)
+      if not cloned then
+        return false, clone_err
+      end
+      local session_file = mentat.get_session_file()
+      if type(session_file) ~= "string" or session_file == "" or session_file == path then
+        return false, "Pi did not create a separate review session"
+      end
+      if not valid() then
+        return false, "The review buffer changed while loading context"
+      end
+      vim.b[bufnr].mentat_review_session = session_file
+      return true
     end)
-
-    local label = context.session_name or context.session_id or "the Pi review context"
-    report_switch(true, nil, string.format("a fork of %s", label))
-  end, source)
+  end):detach()
+  owner.task = task
+  task:on_complete(function(task_err, ok, err)
+    if owner.task == task then
+      owner.task = nil
+    end
+    if task_err ~= "closed" then
+      report_switch(ok, task_err and tostring(task_err) or err, label)
+    end
+  end)
+  return task
 end
 
 return M

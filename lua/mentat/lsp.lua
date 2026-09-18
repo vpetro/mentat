@@ -1,18 +1,70 @@
+local async = vim.async
+local boundary = require("mentat.async")
 local M = {}
 
 local TIMEOUT_MS = 5000
+local is_list = vim.islist
+local get_lsp_clients = vim.lsp.get_clients
 
--- ─── Compatibility shims ───────────────────────────────────────────────────
-
--- vim.islist was added in Neovim 0.10; fall back to vim.tbl_islist on 0.9
-local is_list = vim.islist or vim.tbl_islist
-
--- vim.lsp.get_clients was added in Neovim 0.10; fall back to get_active_clients
-local function get_lsp_clients(opts)
-  if vim.lsp.get_clients then
-    return vim.lsp.get_clients(opts)
+function M.request(bufnr, method, params, timeout_ms)
+  boundary.main()
+  local clients = get_lsp_clients({ bufnr = bufnr, method = method })
+  if #clients == 0 then
+    return {}
   end
-  return vim.lsp.get_active_clients(opts)
+  local task = async.run("mentat LSP " .. method, function()
+    return async.await(function(done)
+      local remaining = #clients
+      local results = {}
+      local requests = {}
+      local closed = false
+      local function response(client, err, result, context)
+        if closed or results[client.id] then
+          return
+        end
+        requests[client.id] = nil
+        results[client.id] = { err = err, result = result, context = context }
+        remaining = remaining - 1
+        if remaining == 0 then
+          done(results)
+        end
+      end
+      for _, client in ipairs(clients) do
+        local accepted, id = client:request(method, params, function(err, result, context)
+          response(client, err, result, context)
+        end, bufnr)
+        if not accepted then
+          response(client, { message = "LSP client stopped before dispatch" })
+        elseif not results[client.id] then
+          requests[client.id] = { client = client, id = id }
+        end
+      end
+      return {
+        close = function(_, callback)
+          closed = true
+          local function cancel()
+            for _, request in pairs(requests) do
+              request.client:cancel_request(request.id)
+            end
+            requests = {}
+            callback()
+          end
+          if vim.in_fast_event() then
+            vim.schedule(cancel)
+          else
+            cancel()
+          end
+        end,
+      }
+    end)
+  end)
+  local ok, result = pcall(async.timeout, timeout_ms or TIMEOUT_MS, task)
+  async.checkpoint()
+  boundary.main()
+  if not ok then
+    return nil, tostring(result)
+  end
+  return result
 end
 
 -- ─── Constants ─────────────────────────────────────────────────────────────
@@ -52,10 +104,6 @@ local function resolve_path(repo_root, rel_path)
   return repo_root .. "/" .. rel_path
 end
 
--- Return (bufnr, is_new).
--- is_new = true means we loaded the buffer here; the LSP client will NOT have
--- auto-attached (that requires BufRead autocommands), so position-based tools
--- will fail gracefully via the client-check below.
 local function get_or_load_buf(abs_path)
   local bufnr = vim.fn.bufnr(abs_path)
   if bufnr ~= -1 and vim.api.nvim_buf_is_loaded(bufnr) then
@@ -208,7 +256,7 @@ local function exec_lsp_hover(input, repo_root)
   if client_err then return client_err end
 
   local params = make_position_params(bufnr, input.line, input.col)
-  local responses, rpc_err = vim.lsp.buf_request_sync(bufnr, "textDocument/hover", params, TIMEOUT_MS)
+  local responses, rpc_err = M.request(bufnr, "textDocument/hover", params)
   if rpc_err then return "LSP error: " .. tostring(rpc_err) end
   if not responses or vim.tbl_isempty(responses) then
     return "No hover info at " .. input.path .. ":" .. input.line .. ":" .. input.col
@@ -223,7 +271,6 @@ local function exec_lsp_hover(input, repo_root)
         table.insert(parts, c)
       elseif type(c) == "table" then
         if c.value then
-          -- MarkupContent or MarkedString { language, value }
           table.insert(parts, c.value)
         elseif is_list(c) then
           for _, item in ipairs(c) do
@@ -259,7 +306,7 @@ local function exec_lsp_definition(input, repo_root)
   if client_err then return client_err end
 
   local params = make_position_params(bufnr, input.line, input.col)
-  local responses, rpc_err = vim.lsp.buf_request_sync(bufnr, "textDocument/definition", params, TIMEOUT_MS)
+  local responses, rpc_err = M.request(bufnr, "textDocument/definition", params)
   if rpc_err then return "LSP error: " .. tostring(rpc_err) end
   if not responses or vim.tbl_isempty(responses) then
     return "No definition found"
@@ -292,7 +339,7 @@ local function exec_lsp_references(input, repo_root)
   local params = make_position_params(bufnr, input.line, input.col)
   params.context = { includeDeclaration = true }
 
-  local responses, rpc_err = vim.lsp.buf_request_sync(bufnr, "textDocument/references", params, TIMEOUT_MS)
+  local responses, rpc_err = M.request(bufnr, "textDocument/references", params)
   if rpc_err then return "LSP error: " .. tostring(rpc_err) end
   if not responses or vim.tbl_isempty(responses) then
     return "No references found"
@@ -335,7 +382,7 @@ local function exec_lsp_document_symbols(input, repo_root)
   if client_err then return client_err end
 
   local params = { textDocument = { uri = vim.uri_from_bufnr(bufnr) } }
-  local responses, rpc_err = vim.lsp.buf_request_sync(bufnr, "textDocument/documentSymbol", params, TIMEOUT_MS)
+  local responses, rpc_err = M.request(bufnr, "textDocument/documentSymbol", params)
   if rpc_err then return "LSP error: " .. tostring(rpc_err) end
   if not responses or vim.tbl_isempty(responses) then
     return "No symbols found"
@@ -360,8 +407,6 @@ end
 local function exec_lsp_workspace_symbols(input, repo_root)
   if not input.query then return "Error: query is required" end
 
-  -- workspace/symbol is not buffer-scoped; we just need any buffer that has
-  -- an attached client so we can route the request.
   local bufnr = vim.api.nvim_get_current_buf()
   if #get_lsp_clients({ bufnr = bufnr }) == 0 then
     for _, b in ipairs(vim.api.nvim_list_bufs()) do
@@ -375,8 +420,8 @@ local function exec_lsp_workspace_symbols(input, repo_root)
     return "No LSP clients are running. Open a source file with an active language server first."
   end
 
-  local responses, rpc_err = vim.lsp.buf_request_sync(
-    bufnr, "workspace/symbol", { query = input.query }, TIMEOUT_MS)
+  local responses, rpc_err = M.request(
+    bufnr, "workspace/symbol", { query = input.query })
   if rpc_err then return "LSP error: " .. tostring(rpc_err) end
   if not responses or vim.tbl_isempty(responses) then
     return "No workspace symbols matched: " .. input.query
@@ -386,7 +431,6 @@ local function exec_lsp_workspace_symbols(input, repo_root)
   for _, resp in pairs(responses) do
     for _, sym in ipairs(resp.result or {}) do
       local kind = SYMBOL_KIND[sym.kind] or ("Kind" .. sym.kind)
-      -- Handle both SymbolInformation (location) and WorkspaceSymbol (location or locationUri)
       local loc_str
       if sym.location then
         loc_str = format_location(sym.location, repo_root)
@@ -426,8 +470,8 @@ local function prepare_call_hierarchy(input, repo_root)
   if client_err then return nil, nil, client_err end
 
   local params = make_position_params(bufnr, input.line, input.col)
-  local responses, rpc_err = vim.lsp.buf_request_sync(
-    bufnr, "textDocument/prepareCallHierarchy", params, TIMEOUT_MS)
+  local responses, rpc_err = M.request(
+    bufnr, "textDocument/prepareCallHierarchy", params)
   if rpc_err then return nil, nil, "LSP error: " .. tostring(rpc_err) end
   if not responses or vim.tbl_isempty(responses) then
     return nil, nil, "No call hierarchy item at " .. input.path .. ":" .. input.line .. ":" .. input.col
@@ -457,8 +501,8 @@ local function exec_lsp_incoming_calls(input, repo_root)
   local bufnr, item, err = prepare_call_hierarchy(input, repo_root)
   if err then return err end
 
-  local responses, rpc_err = vim.lsp.buf_request_sync(
-    bufnr, "callHierarchy/incomingCalls", { item = item }, TIMEOUT_MS)
+  local responses, rpc_err = M.request(
+    bufnr, "callHierarchy/incomingCalls", { item = item })
   if rpc_err then return "LSP error: " .. tostring(rpc_err) end
   if not responses or vim.tbl_isempty(responses) then
     return "No incoming calls found for " .. item.name
@@ -490,8 +534,8 @@ local function exec_lsp_outgoing_calls(input, repo_root)
   local bufnr, item, err = prepare_call_hierarchy(input, repo_root)
   if err then return err end
 
-  local responses, rpc_err = vim.lsp.buf_request_sync(
-    bufnr, "callHierarchy/outgoingCalls", { item = item }, TIMEOUT_MS)
+  local responses, rpc_err = M.request(
+    bufnr, "callHierarchy/outgoingCalls", { item = item })
   if rpc_err then return "LSP error: " .. tostring(rpc_err) end
   if not responses or vim.tbl_isempty(responses) then
     return "No outgoing calls found from " .. item.name

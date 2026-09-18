@@ -2,10 +2,29 @@ local mentat = require("mentat")
 local prompt_loader = require("mentat.prompt_loader")
 local response_view = require("mentat.response")
 local model_picker = require("mentat.model_picker")
+local boundary = require("mentat.async")
+local fs = require("mentat.fs")
+local async = vim.async
 
 local M = {}
 
 local bufnr = nil
+local buffer_tasks = {}
+local pending_files = {}
+local context_epoch = 0
+local load_task
+local save_task
+local log_task
+local logs = {}
+
+local function own(task)
+  buffer_tasks[task] = true
+  task:on_complete(function(err)
+    buffer_tasks[task] = nil
+    boundary.report(err)
+  end)
+  return task
+end
 
 local function get_log_path(root)
   root = root or mentat.get_repo_root()
@@ -18,20 +37,38 @@ local function get_log_path(root)
   return log_dir .. "/" .. date .. ".md"
 end
 
-local function log_to_file(text, root)
+local function log_conversation(prompt, response, err, metadata, root)
   local path = get_log_path(root)
   if not path then return end
-
-  local f = io.open(path, "a")
-  if not f then return end
-  f:write(text)
-  f:close()
-end
-
-local function log_conversation(prompt, response, err, metadata, root)
   local log = string.format("\n## %s\n\n### You\n\n%s\n\n### %s\n\n%s\n---\n",
     os.date("%H:%M:%S"), prompt, response_view.log_heading(metadata), response_view.body(response, metadata, err))
-  log_to_file(log, root)
+  logs[#logs + 1] = { path = path, text = log, written = 0 }
+  if log_task then
+    return
+  end
+  local task = async.run("mentat log", function()
+    async.await(vim.schedule)
+    while logs[1] do
+      local entry = logs[1]
+      if entry.written < #entry.text then
+        local ok, write_err = fs.append(entry.path, entry.text:sub(entry.written + 1), function(count)
+          entry.written = entry.written + count
+        end)
+        if not ok then
+          return false, write_err
+        end
+      end
+      table.remove(logs, 1)
+    end
+    return true
+  end):detach()
+  log_task = task
+  task:on_complete(function(task_err, ok, write_err)
+    if log_task == task then
+      log_task = nil
+    end
+    boundary.report(task_err or (not ok and write_err or nil))
+  end)
 end
 
 local function current_pid()
@@ -146,8 +183,16 @@ local function get_or_create_buf()
   vim.bo[bufnr].buftype = "nofile"
   vim.bo[bufnr].modifiable = true
   model_picker.attach(bufnr, mentat.get_client())
+  vim.api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {
+    buffer = bufnr,
+    callback = function()
+      context_epoch = context_epoch + 1
+      for task in pairs(buffer_tasks) do
+        task:close()
+      end
+    end,
+  })
 
-  -- Configure folding (must be done in window context)
   vim.api.nvim_create_autocmd("BufWinEnter", {
     buffer = bufnr,
     callback = function()
@@ -377,7 +422,7 @@ function M.open(opts)
       if not ok and vim.api.nvim_buf_is_loaded(buf) then
         vim.notify(err, vim.log.levels.ERROR)
       end
-    end)
+    end, opts and opts.repo_root)
   end
 end
 
@@ -428,57 +473,54 @@ end
 -- Alias for backward compatibility
 M.show_files = M.show_context
 
--- Read a file and add it to context
 function M.add_file(filepath)
+  local root = mentat.get_repo_root() or vim.uv.cwd()
   local expanded = vim.fn.expand(filepath)
-
-  -- Check if already added
+  local path = vim.fn.fnamemodify(expanded, ":p")
+  if pending_files[expanded] then
+    vim.notify("File is already loading: " .. expanded, vim.log.levels.WARN)
+    return
+  end
   for _, item in ipairs(M._contexts) do
     if item.type == "file" and item.path == expanded then
       vim.notify("File already in context: " .. expanded, vim.log.levels.WARN)
       return
     end
   end
-
-  local f = io.open(expanded, "r")
-  if not f then
-    vim.notify("Cannot read file: " .. expanded, vim.log.levels.ERROR)
-    return
-  end
-
-  local content = f:read("*a")
-  f:close()
-
-  -- Detect filetype for syntax highlighting hint
-  local ext = vim.fn.fnamemodify(expanded, ":e")
-  local filename = vim.fn.fnamemodify(expanded, ":t")
-
-  M.open()
-  append_lines({
-    "",
-    "## File Added: " .. filename,
-    "",
-    "```" .. ext,
-  })
-
-  -- Split content into lines
-  local lines = {}
-  for line in (content .. "\n"):gmatch("([^\n]*)\n") do
-    table.insert(lines, line)
-  end
-  append_lines(lines)
-  append_lines({ "```", "", "---", "" })
-
-  -- Store context
-  table.insert(M._contexts, {
-    type = "file",
-    path = expanded,
-    name = filename,
-    content = content,
-    ext = ext,
-  })
-
-  vim.notify("File added: " .. filename .. " (" .. #M._contexts .. " items in context)", vim.log.levels.INFO)
+  local buf = get_or_create_buf()
+  local epoch = context_epoch
+  local task = own(async.run("mentat file context", function()
+    async.await(vim.schedule)
+    local content, err = fs.read(path)
+    if not content then
+      vim.notify("Cannot read file: " .. expanded .. ": " .. tostring(err), vim.log.levels.ERROR)
+      return
+    end
+    if epoch ~= context_epoch or not vim.api.nvim_buf_is_loaded(buf) then
+      return
+    end
+    local ext = vim.fn.fnamemodify(expanded, ":e")
+    local filename = vim.fn.fnamemodify(expanded, ":t")
+    M.open({ repo_root = root })
+    append_lines({ "", "## File Added: " .. filename, "", "```" .. ext })
+    append_lines(vim.split(content, "\n", { plain = true }))
+    append_lines({ "```", "", "---", "" })
+    table.insert(M._contexts, {
+      type = "file",
+      path = expanded,
+      name = filename,
+      content = content,
+      ext = ext,
+    })
+    vim.notify("File added: " .. filename .. " (" .. #M._contexts .. " items in context)", vim.log.levels.INFO)
+  end):detach())
+  pending_files[expanded] = task
+  task:on_complete(function()
+    if pending_files[expanded] == task then
+      pending_files[expanded] = nil
+    end
+  end)
+  return task
 end
 
 -- Add a selection to context
@@ -563,8 +605,11 @@ function M.add_diagnostics(bufnr)
     vim.log.levels.INFO)
 end
 
--- Clear contexts
 function M.clear_context()
+  context_epoch = context_epoch + 1
+  for _, task in pairs(pending_files) do
+    task:close()
+  end
   M._contexts = {}
   vim.notify("Context cleared", vim.log.levels.INFO)
 end
@@ -654,11 +699,16 @@ function M.promote()
 end
 
 function M.clear()
+  local root = mentat.get_repo_root()
   local accepted, err = mentat.clear(function(ok, rpc_err, switched)
     if ok or switched then
+      context_epoch = context_epoch + 1
+      for _, task in pairs(pending_files) do
+        task:close()
+      end
       M._contexts = {}
       M._last_prompt = nil
-      claim_instance(mentat.get_repo_root(), mentat.get_session_file())
+      claim_instance(root, mentat.get_session_file())
       if bufnr and vim.api.nvim_buf_is_loaded(bufnr) then
         vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "# Mentat Chat", "" })
       end
@@ -734,38 +784,45 @@ function M.load_last_session()
   local root = mentat.get_repo_root()
   if not root then return end
   local log_dir = root .. "/.mentat/logs"
-  
-  local files = vim.split(vim.fn.glob(log_dir .. "/*.md"), "\n", { trimempty = true })
-  if #files == 0 then
-    vim.notify("No session logs found.", vim.log.levels.WARN)
-    return
-  end
-  
-  table.sort(files)
-  local last_log = files[#files]
-  
-  local f = io.open(last_log, "r")
-  if not f then 
-    vim.notify("Could not read log file: " .. last_log, vim.log.levels.ERROR)
-    return 
-  end
-  local content = f:read("*a")
-  f:close()
-  
-  -- Restore buffer content
   local buf = get_or_create_buf()
-  local lines = vim.split(content, "\n")
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  scroll_to_bottom(buf)
-  M.open()
-  
-  -- Restore transcript history
-  restore_history_from_content(content)
-  
-  vim.notify("Loaded session: " .. vim.fn.fnamemodify(last_log, ":t"), vim.log.levels.INFO)
+  local tick = vim.api.nvim_buf_get_changedtick(buf)
+  if load_task then
+    load_task:close()
+  end
+  load_task = own(async.run("mentat load log", function()
+    async.await(vim.schedule)
+    local entries = fs.list(log_dir)
+    local files = {}
+    for _, entry in ipairs(entries or {}) do
+      if entry.name:match("%.md$") then
+        files[#files + 1] = entry.name
+      end
+    end
+    if #files == 0 then
+      vim.notify("No session logs found.", vim.log.levels.WARN)
+      return
+    end
+    table.sort(files)
+    local last_log = files[#files]
+    local content, err = fs.read(log_dir .. "/" .. last_log)
+    if not content then
+      vim.notify("Could not read log file: " .. last_log .. ": " .. tostring(err), vim.log.levels.ERROR)
+      return
+    end
+    if not vim.api.nvim_buf_is_loaded(buf) or vim.api.nvim_buf_get_changedtick(buf) ~= tick then
+      vim.notify("The conversation changed; load the log again", vim.log.levels.WARN)
+      return
+    end
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(content, "\n"))
+    scroll_to_bottom(buf)
+    M.open({ repo_root = root })
+    restore_history_from_content(content)
+    vim.notify("Loaded session: " .. last_log, vim.log.levels.INFO)
+  end):detach())
+  return load_task
 end
 
-function M.save_state()
+local function state_snapshot()
   local session_file = mentat.get_session_file()
   if not bufnr and not session_file and vim.tbl_isempty(mentat.messages) and vim.tbl_isempty(M._contexts) then
     return
@@ -790,8 +847,60 @@ function M.save_state()
     buffer_content = content
   }
 
-  write_json_file(state_file, state)
-  claim_instance(root, state.pi_session_file)
+  return root, state_file, state
+end
+
+function M.save_state()
+  local root, path, state = state_snapshot()
+  if not root then return end
+  local content = vim.json.encode(state)
+  if save_task then
+    save_task:close()
+  end
+  local task = async.run("mentat save state", function()
+    async.await(vim.schedule)
+    ensure_parent_dir(path)
+    local ok, err = fs.atomic_write(path, content)
+    if ok then
+      claim_instance(root, state.pi_session_file)
+    end
+    return ok, err
+  end):detach()
+  save_task = task
+  task:on_complete(function(task_err, ok, err)
+    if save_task == task then
+      save_task = nil
+    end
+    boundary.report(task_err or (not ok and err or nil))
+  end)
+  return task
+end
+
+function M.save_state_sync()
+  if save_task then
+    save_task:close()
+  end
+  if log_task then
+    log_task:close()
+  end
+  while logs[1] do
+    local entry = logs[1]
+    if entry.written < #entry.text then
+      local ok, err = fs.append_sync(entry.path, entry.text:sub(entry.written + 1), function(count)
+        entry.written = entry.written + count
+      end)
+      if not ok then
+        vim.notify("Could not save Mentat log: " .. tostring(err), vim.log.levels.ERROR)
+        break
+      end
+    end
+    table.remove(logs, 1)
+  end
+  local root, path, state = state_snapshot()
+  if root then
+    write_json_file(path, state)
+    claim_instance(root, state.pi_session_file)
+  end
 end
 
 function M.load_state()
@@ -802,28 +911,73 @@ function M.load_state()
   end
   local root = mentat.get_repo_root()
   if not root then return end
-  local state = read_json_file(root .. "/.mentat/state.json")
-  if type(state) ~= "table" then return end
-
-  local current = mentat.get_session_file()
-  local reuse = #other_active_instance_claims(root) == 0
-  local saved = type(state.pi_session_file) == "string" and state.pi_session_file or nil
-  local recovery = type(state.pi_restore_selection) == "table" and state.pi_restore_selection or nil
-  if not recovery and (not saved or vim.fn.filereadable(saved) ~= 1) and type(state.pi_selection) == "table" then
-    recovery = state.pi_selection
+  local buf = get_or_create_buf()
+  local tick = vim.api.nvim_buf_get_changedtick(buf)
+  local revision = client.state.revision
+  if load_task then
+    load_task:close()
   end
-
-  local function loaded(ok, err)
+  load_task = own(async.run("mentat load state", function()
+    async.await(vim.schedule)
+    local content, read_err = fs.read(root .. "/.mentat/state.json")
+    if not content then
+      if not (read_err and read_err:find("ENOENT", 1, true)) then
+        vim.notify("Could not load Mentat state: " .. tostring(read_err), vim.log.levels.ERROR)
+      end
+      return
+    end
+    local decoded, state = pcall(vim.json.decode, content)
+    if not decoded or type(state) ~= "table" then
+      vim.notify("Could not load Mentat state: invalid JSON", vim.log.levels.ERROR)
+      return
+    end
+    if not vim.api.nvim_buf_is_loaded(buf) or vim.api.nvim_buf_get_changedtick(buf) ~= tick or client.state.revision ~= revision then
+      vim.notify("The conversation changed; load the state again", vim.log.levels.WARN)
+      return
+    end
+    local current = mentat.get_session_file()
+    local reuse = #other_active_instance_claims(root) == 0
+    local saved = type(state.pi_session_file) == "string" and state.pi_session_file or nil
+    local recovery = type(state.pi_restore_selection) == "table" and state.pi_restore_selection or nil
+    if not recovery and (not saved or vim.fn.filereadable(saved) ~= 1) and type(state.pi_selection) == "table" then
+      recovery = state.pi_selection
+    end
+    local ok, err
+    if reuse and saved and current then
+      ok, err = boundary.call(function(done)
+        return mentat.switch_session(saved, done, root)
+      end)
+      if ok and recovery then
+        client.restore_settings(recovery)
+        ok, err = boundary.call(function(done)
+          return mentat.prepare(done, root)
+        end)
+      end
+    else
+      if reuse then
+        mentat.session_file = saved
+        if recovery then
+          client.restore_settings(recovery)
+        end
+      end
+      ok, err = boundary.call(function(done)
+        return mentat.prepare(done, root)
+      end)
+    end
     if not ok then
       vim.notify("Could not load Mentat state: " .. tostring(err), vim.log.levels.ERROR)
       return
     end
+    if vim.api.nvim_buf_get_changedtick(buf) ~= tick then
+      vim.notify("The draft changed while loading state; its text was kept", vim.log.levels.WARN)
+      return
+    end
+    context_epoch = context_epoch + 1
     mentat.messages = type(state.messages) == "table" and state.messages or {}
     M._contexts = type(state.contexts) == "table" and state.contexts or {}
     M._last_prompt = nil
     claim_instance(root, mentat.get_session_file())
     if type(state.buffer_content) == "string" and state.buffer_content ~= "" then
-      local buf = get_or_create_buf()
       model_picker.invalidate(buf)
       local lines = vim.split(state.buffer_content, "\n")
       vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
@@ -832,33 +986,11 @@ function M.load_state()
         M.open({ prepare = false })
       end
     end
-  end
-
-  local function recover(ok, err)
-    if not ok then
-      loaded(false, err)
-    elseif reuse and recovery then
-      client.restore_settings(recovery)
-      mentat.prepare(loaded)
-    else
-      loaded(true)
+    if not reuse and saved then
+      vim.notify("Mentat is using a separate Pi session because another Neovim instance is active for this repo.", vim.log.levels.INFO)
     end
-  end
-
-  if reuse and saved and current then
-    mentat.switch_session(saved, recover)
-  else
-    if reuse then
-      mentat.session_file = saved
-      if recovery then
-        client.restore_settings(recovery)
-      end
-    end
-    mentat.prepare(loaded)
-  end
-  if not reuse and saved then
-    vim.notify("Mentat is using a separate Pi session because another Neovim instance is active for this repo.", vim.log.levels.INFO)
-  end
+  end):detach())
+  return load_task
 end
 
 function M.release_instance_claim()

@@ -1,6 +1,6 @@
 # Mentat
 
-Mentat runs Pi conversations in Neovim. This version uses the Pi 0.85.1 RPC contract, including `agent_settled` and supported-thinking-level discovery. It targets Neovim nightly with LuaJIT.
+Mentat runs Pi conversations in Neovim. This version uses the Pi 0.85.1 RPC contract, including `agent_settled` and supported-thinking-level discovery. It requires Neovim 0.13 nightly with LuaJIT and native `vim.async`.
 
 ## Model and thinking selection
 
@@ -63,9 +63,17 @@ Errors and aborted requests use `Status: error` or `Status: aborted`; the reason
 
 Mentat's saved state includes recovery settings for an interrupted one-shot override. Branch transcripts are not included in the main conversation's saved UI state or daily log.
 
+## Async operations and persistence
+
+LSP queries and Pi request/response workflows use native async tasks. Streaming events still update the response as they arrive. Each client, bridge connection, picker, branch startup, and review buffer owns its pending work. Disposal cancels owned tasks; it does not close a UI provider's popup. Late callbacks cannot apply a stale choice or write to a closed connection.
+
+Runtime file reads and staged writes use asynchronous libuv I/O. Cold LSP buffers still use native `bufload` so buffer-read autocmds and LSP attachment keep working. Small bundled prompt reads, instance-claim files, and filesystem metadata checks remain synchronous.
+
+Daily logs remain append-only across Neovim instances. Opening and closing a log file is asynchronous, but each append commits synchronously and records its byte count before yielding. This lets `VimLeavePre` stop pending work and flush only unwritten bytes without waiting for an I/O callback or appending an entry twice. State-file replacement also uses a synchronous rename after its async write and close. Final exit persistence is synchronous; it does not start a nested event loop.
+
 ## Tests
 
-Run from the repository root:
+Tested with Neovim `v0.13.0-dev-1510+gce8a897f98-Homebrew`. Run from the repository root:
 
 ```sh
 nvim --headless -u NONE --noplugin -l tests/run.lua
@@ -73,4 +81,6 @@ nvim --headless -u NONE --noplugin -c 'lua local files = vim.fn.glob("{lua,plugi
 git diff --check
 ```
 
-The tests mock Pi jobs, channels, catalogs, and session files. They use real Neovim buffers, mappings, extmarks, and timers, with bounded fixture waits. They require no Pi credentials and send no model prompts. Coverage includes selection/restoration, branch isolation, stale callbacks, draft preservation, retry/compaction timing, RPC timeout cleanup, and callback-triggered process restarts with trailing stdout/stderr.
+The tests mock Pi jobs, channels, catalogs, and session files. They use real Neovim buffers, filesystem I/O, subprocesses, TCP sockets, and timers, with bounded fixture waits. They require no Pi credentials and send no model prompts.
+
+Coverage includes response layout and timing, selection/restoration, LSP aggregation and cancellation, concurrent bridge requests, and callback-triggered process restarts with trailing stdout/stderr. Filesystem and workflow cases cover late-opened descriptors, temporary-file ownership, branch/review/picker disposal, repository capture across yields, and partial log writes with exactly-once exit flushing. Each case checks for remaining async tasks, active libuv handles, and Neovim errors after cleanup.

@@ -2,6 +2,9 @@ local transport = require("mentat.transports.pi_rpc")
 local editor_bridge = require("mentat.editor_bridge")
 local prompt_loader = require("mentat.prompt_loader")
 local models = require("mentat.models")
+local boundary = require("mentat.async")
+local fs = require("mentat.fs")
+local async = vim.async
 
 local M = {}
 
@@ -116,25 +119,15 @@ function M.get_repo_root()
   return nil
 end
 
-local function load_repo_system_prompt()
-  local root = M.get_repo_root()
+local function load_repo_system_prompt(root)
   if not root then
     return nil
   end
 
-  local prompt_path = root .. "/" .. M.config.system_prompt_file
-  local handle = io.open(prompt_path, "r")
-  if not handle then
-    return nil
-  end
-
-  local content = handle:read("*a")
-  handle:close()
-  return content
+  return fs.read(root .. "/" .. M.config.system_prompt_file)
 end
 
-local function get_directory_tree()
-  local root = M.get_repo_root()
+local function get_directory_tree(root)
   if not root then
     return nil
   end
@@ -143,24 +136,18 @@ local function get_directory_tree()
     "cd %s && (fd --type f --hidden --exclude .git --exclude node_modules --exclude .mentat 2>/dev/null || find . -type f -not -path './.git/*' -not -path './node_modules/*' -not -path './.mentat/*' 2>/dev/null) | head -200 | sort",
     vim.fn.shellescape(root)
   )
-  local handle = io.popen(cmd)
-  if not handle then
-    return nil
-  end
-
-  local result = handle:read("*a")
-  handle:close()
-
-  if result and result ~= "" then
-    return result
+  local result = boundary.system({ "sh", "-c", cmd }, { text = true })
+  if result and result.stdout and result.stdout ~= "" then
+    return result.stdout
   end
   return nil
 end
 
-function M.get_system_prompt()
+function M.get_system_prompt(root)
+  root = root or M.get_repo_root()
   local prompt_parts = {}
 
-  local base_prompt = M.config.system_prompt or load_repo_system_prompt()
+  local base_prompt = M.config.system_prompt or load_repo_system_prompt(root)
   if base_prompt then
     table.insert(prompt_parts, base_prompt)
   end
@@ -170,7 +157,7 @@ function M.get_system_prompt()
     table.insert(prompt_parts, built_in_prompt)
   end
 
-  local tree = get_directory_tree()
+  local tree = get_directory_tree(root)
   if tree then
     local project_structure = prompt_loader.render("project_structure.md", {
       tree = tree,
@@ -214,36 +201,18 @@ local function set_parent_session(path, parent_session)
     return "Pi did not create a cloned session file"
   end
 
-  local input, open_err = io.open(path, "r")
-  if not input then
-    return tostring(open_err)
+  local content, read_err = fs.read(path)
+  if not content then
+    return tostring(read_err)
   end
-  local first = input:read("*l")
-  local rest = input:read("*a") or ""
-  input:close()
-
-  local ok, header = pcall(vim.json.decode, first or "")
+  local first, rest = content:match("^([^\n]*)\n(.*)$")
+  local ok, header = pcall(vim.json.decode, first or content)
   if not ok or type(header) ~= "table" or header.type ~= "session" then
     return "Cloned Pi session has an invalid header"
   end
   header.parentSession = parent_session
-
-  local temp = string.format("%s.mentat-%s", path, tostring((vim.uv or vim.loop).hrtime()))
-  local output, write_err = io.open(temp, "w")
-  if not output then
-    return tostring(write_err)
-  end
-  output:write(vim.json.encode(header), "\n", rest)
-  output:close()
-  local uv = vim.uv or vim.loop
-  uv.fs_chmod(temp, 384)
-
-  local renamed, rename_err = os.rename(temp, path)
-  if not renamed then
-    vim.fn.delete(temp)
-    return tostring(rename_err)
-  end
-  return nil
+  local written, write_err = fs.atomic_write(path, vim.json.encode(header) .. "\n" .. (rest or ""))
+  return not written and tostring(write_err) or nil
 end
 
 local function stat_signature(path)
@@ -283,7 +252,7 @@ local function build_extension_signatures(extensions, repo_root)
 end
 
 local function prepare_system_prompt_file(repo_root)
-  local system_prompt = M.get_system_prompt()
+  local system_prompt = M.get_system_prompt(repo_root)
   if not system_prompt or system_prompt == "" then
     return nil
   end
@@ -291,13 +260,10 @@ local function prepare_system_prompt_file(repo_root)
   local prompt_path = repo_root .. "/.mentat/pi/system_prompt.generated.md"
   ensure_parent_dir(prompt_path)
 
-  local handle = io.open(prompt_path, "w")
-  if not handle then
-    return nil
+  local ok, err = fs.atomic_write(prompt_path, system_prompt)
+  if not ok then
+    error("Could not write Mentat system prompt: " .. tostring(err), 0)
   end
-
-  handle:write(system_prompt)
-  handle:close()
   return prompt_path
 end
 
@@ -368,8 +334,8 @@ local function build_transport_opts(repo_root)
   }
 end
 
-local function start_config()
-  local root = M.get_repo_root() or vim.loop.cwd()
+local function start_config(root)
+  root = root or M.get_repo_root() or vim.loop.cwd()
   return function()
     return build_transport_opts(root)
   end
@@ -385,8 +351,8 @@ function M.get_client()
   return transport
 end
 
-function M.prepare(on_done)
-  return transport.ensure_started(start_config(), on_done)
+function M.prepare(on_done, root)
+  return transport.ensure_started(start_config(root), on_done)
 end
 
 function M.clear(on_done)
@@ -446,25 +412,13 @@ end
 function M.fork(on_done)
   local root = M.get_repo_root() or vim.loop.cwd()
   local client
-  local cancelled = false
-  local completed = false
-  local function complete(forked, err, source)
-    if completed or cancelled then
-      return
-    end
-    completed = true
-    if not forked and client then
-      client.stop()
-    end
-    on_done(forked, err, source)
-  end
-  local accepted, err = M.prepare(function(ok, prepare_err)
-    if cancelled then
-      return
-    end
+  local task = async.run("mentat fork", function()
+    async.await(vim.schedule)
+    local ok, prepare_err = boundary.call(function(done)
+      return M.prepare(done, root)
+    end, false)
     if not ok then
-      complete(nil, prepare_err)
-      return
+      return nil, prepare_err
     end
     local inherited = transport.get_selection()
     local source = M.get_session_file()
@@ -475,61 +429,56 @@ function M.fork(on_done)
     opts.session_file = source
     opts.default_selection = inherited
     client = transport.new()
-    client.ensure_started(opts, function(started, start_err)
-      if cancelled then
-        return
-      end
-      if not started then
-        complete(nil, start_err)
-        return
-      end
-      local function inherit(cloned, clone_err)
-        if cancelled then
-          return
-        end
-        if not cloned then
-          complete(nil, clone_err)
-          return
-        end
-        client.set_selection(inherited, function(selected, selection_err)
-          complete(selected and client or nil, selection_err, source)
-        end)
-      end
-      if source then
-        client.clone_session(inherit)
-      else
-        inherit(true)
-      end
+    local started, start_err = boundary.call(function(done)
+      return client.ensure_started(opts, done)
     end)
-  end)
-  if not accepted then
-    vim.schedule(function()
-      complete(nil, err)
-    end)
-  end
-  return function()
-    cancelled = true
-    if client then
-      client.stop("Mentat branch closed")
+    if not started then
+      return nil, start_err
     end
-  end
+    if source then
+      local cloned, clone_err = boundary.call(client.clone_session)
+      if not cloned then
+        return nil, clone_err
+      end
+    end
+    local selected, selection_err = boundary.call(function(done)
+      return client.set_selection(inherited, done)
+    end)
+    return selected and client or nil, selection_err, source
+  end):detach()
+  task:on_complete(function(task_err, forked, err, source)
+    local function complete()
+      if not forked and client then
+        client.stop("Mentat branch closed")
+      end
+      if task_err ~= "closed" then
+        on_done(forked, task_err and tostring(task_err) or err, source)
+      end
+    end
+    if vim.in_fast_event() then
+      vim.schedule(complete)
+    else
+      complete()
+    end
+  end)
+  return task
 end
 
 function M.get_session_file()
   return transport.state.session_file or M.session_file
 end
 
-function M.switch_session(session_file, on_done)
-  local accepted, err = transport.switch_session(session_file, on_done, start_config())
+function M.switch_session(session_file, on_done, root)
+  local accepted, err, task = transport.switch_session(session_file, on_done, start_config(root))
   if not accepted and on_done then
     on_done(false, err)
   end
-  return accepted, err
+  return accepted, err, task
 end
 
-function M.clone_session_from(session_file, on_done, parent_session)
-  local accepted, err = transport.clone_from(session_file, on_done, {
-    start_config = start_config(),
+function M.clone_session_from(session_file, on_done, parent_session, root)
+  local accepted, err, task = transport.clone_from(session_file, on_done, {
+    start_config = start_config(root),
     prepare_clone = function(path)
       return set_parent_session(path, parent_session)
     end,
@@ -537,7 +486,7 @@ function M.clone_session_from(session_file, on_done, parent_session)
   if not accepted and on_done then
     on_done(false, err)
   end
-  return accepted, err
+  return accepted, err, task
 end
 
 function M.stop()

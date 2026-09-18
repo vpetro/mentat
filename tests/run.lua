@@ -15,18 +15,40 @@ local function contains(text, part)
   assert(type(text) == "string" and text:find(part, 1, true), "Expected " .. vim.inspect(text) .. " to contain " .. vim.inspect(part))
 end
 
+require("async")(test, eq, contains)
+require("lsp")(test, eq, contains)
+require("bridge")(test, eq, contains)
 require("transport")(test, eq, contains)
+require("transport_async")(test, eq, contains)
 require("ui")(test, eq, contains)
+require("workflows")(test, eq, contains)
 
 local failed = 0
 for _, item in ipairs(tests) do
+  local handles = {}
+  vim.uv.walk(function(handle) handles[handle] = true end)
   local f = fixture.new()
   vim.v.errmsg = ""
   local ok, err = xpcall(function()
     item.run(f)
     eq(vim.v.errmsg, "", "Neovim reported an asynchronous error")
   end, debug.traceback)
-  f.close()
+  local cleaned, cleanup_err = xpcall(function()
+    f.close()
+    eq(vim.async._inspect_tree(), "", "Async tasks remained after cleanup")
+    local active = {}
+    vim.uv.walk(function(handle)
+      if not handles[handle] and handle:is_active() then
+        active[#active + 1] = tostring(handle)
+      end
+    end)
+    eq(active, {}, "Active libuv handles remained after cleanup")
+    eq(vim.v.errmsg, "", "Neovim reported an asynchronous cleanup error")
+  end, debug.traceback)
+  if not cleaned then
+    ok = false
+    err = (err and (err .. "\n") or "") .. cleanup_err
+  end
   if ok then
     io.stdout:write("PASS " .. item.name .. "\n")
   else

@@ -129,13 +129,13 @@ function M.open(initial_text)
     buffer = buf,
     callback = function()
       branches[buf] = nil
-      if branch.cancel then
-        branch.cancel()
+      if branch.startup_task then
+        branch.startup_task:close()
       end
     end,
   })
 
-  branch.cancel = mentat.fork(function(client, err, source)
+  branch.startup_task = mentat.fork(function(client, err, source)
     if not vim.api.nvim_buf_is_loaded(buf) then
       if client then
         client.stop()

@@ -1,5 +1,7 @@
 local models = require("mentat.models")
-local uv = vim.uv or vim.loop
+local boundary = require("mentat.async")
+local uv = vim.uv
+local async = vim.async
 local M = {}
 
 M.config = {
@@ -125,18 +127,19 @@ local function tool_summary(name, args)
   return string.format("\n\n> *%s*\n\n", name)
 end
 
-local function close_timer(timer)
-  if timer and not timer:is_closing() then
-    timer:stop()
-    timer:close()
-  end
-end
-
 local function joined_error(first, second)
   if first and second then
     return first .. "; " .. second
   end
   return first or second
+end
+
+local function on_main(callback)
+  if vim.in_fast_event() then
+    vim.schedule(callback)
+  else
+    callback()
+  end
 end
 
 local function new_client()
@@ -152,12 +155,12 @@ local function new_client()
   local stdout_buffer = ""
   local stderr_buffer = ""
   local listeners = {}
+  local ui_tasks = {}
   local needs_defaults = false
   local selection_error
   local restore_selection
   local resume_selection
   local terminate
-  local settle_prompt
 
   local function changed()
     for listener in pairs(listeners) do
@@ -221,29 +224,42 @@ local function new_client()
   end
 
   local function finish(op, ...)
-    if operation ~= op then
+    if operation ~= op or op.finishing then
       return
     end
-    operation = nil
-    for id, entry in pairs(pending) do
-      if entry.op == op then
-        close_timer(entry.timer)
-        pending[id] = nil
+    op.finishing = true
+    local results = vim.F.pack_len(...)
+    if op.abort_task then
+      op.abort_task:close()
+    end
+    local function complete()
+      local function deliver()
+        if operation ~= op then
+          return
+        end
+        operation = nil
+        state.busy = false
+        changed()
+        op.on_done(vim.F.unpack_len(results))
+      end
+      if op.launching then
+        vim.schedule(deliver)
+      else
+        on_main(deliver)
       end
     end
     if op.cleanup then
-      op.cleanup()
+      op.cleanup(complete)
+    else
+      complete()
     end
-    state.busy = false
-    changed()
-    op.on_done(...)
   end
 
-  local function finish_prompt(op, err, status)
+  local function prompt_result(op, err, status)
     local prompt = op.prompt
     prompt.metadata.total_ms = prompt.metadata.total_ms or (uv.hrtime() - prompt.started) / 1e6
     prompt.metadata.status = status or (err and "error" or "complete")
-    finish(op, prompt.text, err, vim.deepcopy(prompt.metadata))
+    return prompt.text, err, vim.deepcopy(prompt.metadata)
   end
 
   local function begin(kind, on_done)
@@ -253,7 +269,9 @@ local function new_client()
     local op = { kind = kind, on_done = on_done or function() end }
     op.fail = function(err, status)
       if op.prompt then
-        finish_prompt(op, err, status)
+        finish(op, prompt_result(op, err, status))
+      elseif op.list then
+        finish(op, nil, err)
       else
         finish(op, false, err)
       end
@@ -261,23 +279,34 @@ local function new_client()
     operation = op
     state.busy = true
     state.revision = state.revision + 1
-    changed()
     return op
   end
 
-  local function schedule(op, action)
-    vim.schedule(function()
-      if operation == op then
-        action()
-      end
+  local function launch(op, work)
+    op.launching = true
+    local task = async.run("mentat Pi " .. op.kind, function()
+      async.await(vim.schedule)
+      return work()
+    end):detach()
+    op.task = task
+    task:on_complete(function(task_err, ...)
+      local results = vim.F.pack_len(...)
+      on_main(function()
+        if operation ~= op or op.failure then
+          return
+        end
+        if task_err then
+          local err = task_err == "closed" and "Pi operation cancelled" or tostring(task_err)
+          terminate(err, nil, true)
+          op.fail(err)
+        else
+          finish(op, vim.F.unpack_len(results))
+        end
+      end)
     end)
-  end
-
-  local function clear_pending()
-    for _, request in pairs(pending) do
-      close_timer(request.timer)
-    end
-    pending = {}
+    changed()
+    op.launching = false
+    return true, nil, task
   end
 
   local function send_raw(payload)
@@ -295,123 +324,135 @@ local function new_client()
     return true
   end
 
-  local function request(op, command, callback, no_timeout)
-    if operation ~= op then
-      return
-    end
-    next_id = next_id + 1
-    local id = "mentat-" .. next_id
-    command.id = id
-    local entry = { callback = callback, op = op }
-    pending[id] = entry
-    if not no_timeout then
-      local epoch = generation
-      entry.timer = vim.defer_fn(function()
-        if pending[id] == entry and epoch == generation then
-          terminate("Pi RPC timed out: " .. command.type)
+  local function request(op, command, no_timeout, until_settled)
+    local function response()
+      return async.await(function(done)
+        next_id = next_id + 1
+        local id = "mentat-" .. next_id
+        command.id = id
+        local entry = { callback = done, op = op }
+        pending[id] = entry
+        local wake
+        if until_settled then
+          wake = function() done(nil) end
+          op.prompt.wake = wake
         end
-      end, (active_config or M.config).rpc_timeout_ms or 30000)
+        if command.type == "prompt" then
+          op.prompt.sent = true
+        end
+        local ok, err = send_raw(command)
+        if not ok then
+          done(nil, err)
+        end
+        return {
+          close = function(_, callback)
+            if pending[id] == entry then
+              pending[id] = nil
+            end
+            if wake and op.prompt.wake == wake then
+              op.prompt.wake = nil
+            end
+            callback()
+          end,
+        }
+      end)
     end
-    local ok, err = send_raw(command)
+    local ok, payload, err
+    if no_timeout then
+      payload, err = response()
+      ok = true
+    else
+      local task = async.run("mentat RPC " .. command.type, response)
+      ok, payload, err = pcall(async.timeout, (active_config or M.config).rpc_timeout_ms or 30000, task)
+      async.checkpoint()
+    end
+    boundary.main()
     if not ok then
-      terminate(err)
+      err = payload == "timeout" and ("Pi RPC timed out: " .. command.type) or tostring(payload)
+      payload = nil
     end
+    if err then
+      terminate(err, nil, true)
+    end
+    return payload, err
   end
 
-  local function refresh(op, on_done)
-    request(op, { type = "get_state" }, function(response)
-      if not response.success then
-        on_done(false, response.error or "Failed to read Pi state")
-        return
-      end
-      local ok, err = update_state(response.data)
-      if not ok then
-        on_done(false, err)
-        return
-      end
-      state.thinking_levels = nil
-      request(op, { type = "get_available_thinking_levels" }, function(levels_response)
-        local data = value(levels_response.data)
-        if not levels_response.success or type(data) ~= "table" or type(data.levels) ~= "table" then
-          on_done(false, levels_response.error or "Pi returned invalid thinking levels")
-          return
-        end
-        state.thinking_levels = vim.deepcopy(data.levels)
-        changed()
-        on_done(true)
-      end)
-    end)
+  local function refresh(op)
+    local response, rpc_err = request(op, { type = "get_state" })
+    if not response or not response.success then
+      return false, rpc_err or (response and response.error) or "Failed to read Pi state"
+    end
+    local ok, err = update_state(response.data)
+    if not ok then
+      return false, err
+    end
+    state.thinking_levels = nil
+    local levels_response, levels_err = request(op, { type = "get_available_thinking_levels" })
+    local data = levels_response and value(levels_response.data)
+    if not levels_response or not levels_response.success or type(data) ~= "table" or type(data.levels) ~= "table" then
+      return false, levels_err or (levels_response and levels_response.error) or "Pi returned invalid thinking levels"
+    end
+    state.thinking_levels = vim.deepcopy(data.levels)
+    changed()
+    return true
   end
 
-  local function apply_selection(op, selection, on_done)
-    local function apply(resolved)
-      local function set_thinking()
-        if not resolved.thinking or state.thinking_level == resolved.thinking then
-          on_done(true)
-          return
-        end
-        request(op, { type = "set_thinking_level", level = resolved.thinking }, function(response)
-          refresh(op, function(ok, err)
-            local setter_err = not response.success and (response.error or "Failed to set thinking level") or nil
-            on_done(response.success and ok, joined_error(setter_err, err))
-          end)
-        end)
+  local function apply_selection(op, selection)
+    local resolved = selection
+    if selection.model then
+      local response, rpc_err = request(op, { type = "get_available_models" })
+      local data = response and value(response.data)
+      if not response or not response.success or type(data) ~= "table" or type(data.models) ~= "table" then
+        return false, rpc_err or (response and response.error) or "Pi returned an invalid model catalog"
       end
-      if not resolved.model or (state.model and state.model.provider == resolved.provider and state.model.id == resolved.model) then
-        set_thinking()
-        return
-      end
-      request(op, { type = "set_model", provider = resolved.provider, modelId = resolved.model }, function(response)
-        refresh(op, function(ok, err)
-          if not response.success or not ok then
-            local setter_err = not response.success and (response.error or "Failed to switch model") or nil
-            on_done(false, joined_error(setter_err, err))
-            return
-          end
-          set_thinking()
-        end)
-      end)
-    end
-    if not selection.model then
-      apply(selection)
-      return
-    end
-    request(op, { type = "get_available_models" }, function(response)
-      local data = value(response.data)
-      if not response.success or type(data) ~= "table" or type(data.models) ~= "table" then
-        on_done(false, response.error or "Pi returned an invalid model catalog")
-        return
-      end
-      local resolved, err = models.resolve(selection, data.models)
+      local err
+      resolved, err = models.resolve(selection, data.models)
       if not resolved then
-        on_done(false, err)
-        return
+        return false, err
       end
-      apply(resolved)
-    end)
+    end
+    if resolved.model and not (state.model and state.model.provider == resolved.provider and state.model.id == resolved.model) then
+      local response, rpc_err = request(op, { type = "set_model", provider = resolved.provider, modelId = resolved.model })
+      if not response then
+        return false, rpc_err
+      end
+      local ok, err = refresh(op)
+      if not response.success or not ok then
+        local setter_err = not response.success and (response.error or "Failed to switch model") or nil
+        return false, joined_error(setter_err, err)
+      end
+    end
+    if resolved.thinking and state.thinking_level ~= resolved.thinking then
+      local response, rpc_err = request(op, { type = "set_thinking_level", level = resolved.thinking })
+      if not response then
+        return false, rpc_err
+      end
+      local ok, err = refresh(op)
+      local setter_err = not response.success and (response.error or "Failed to set thinking level") or nil
+      return response.success and ok, joined_error(setter_err, err)
+    end
+    return true
   end
 
-  local function restore(op, on_done)
+  local function restore(op)
     if not restore_selection then
-      on_done(true)
-      return
+      return true
     end
-    apply_selection(op, restore_selection, function(ok, err)
-      if ok then
-        restore_selection = nil
-        state.selection = models.from_state(state)
-        selection_error = nil
-        changed()
-      end
-      on_done(ok, err and ("Could not restore the selected settings: " .. err) or nil)
-    end)
+    local ok, err = apply_selection(op, restore_selection)
+    if ok then
+      restore_selection = nil
+      state.selection = models.from_state(state)
+      selection_error = nil
+      changed()
+    end
+    return ok, err and ("Could not restore the selected settings: " .. err) or nil
   end
 
   terminate = function(err, status, keep_operation)
     local old_job = job_id
     job_id = nil
     generation = generation + 1
-    clear_pending()
+    pending = {}
     resume_selection = vim.deepcopy(state.selection)
     active_config = nil
     stdout_buffer = ""
@@ -420,13 +461,21 @@ local function new_client()
     state.is_streaming = false
     state.is_compacting = false
     state.revision = state.revision + 1
-    changed()
+    for task in pairs(ui_tasks) do
+      task:close()
+    end
     if old_job then
       pcall(vim.fn.jobstop, old_job)
     end
-    if operation and not keep_operation then
-      operation.fail(err or "Pi process stopped", status)
+    local op = operation
+    if op and not keep_operation then
+      op.failure = err or "Pi process stopped"
+      if op.task then
+        op.task:close()
+      end
+      op.fail(op.failure, status)
     end
+    changed()
   end
 
   function client.stop(reason)
@@ -436,36 +485,42 @@ local function new_client()
   local function handle_ui_request(ui_request)
     local epoch = generation
     local revision = state.revision
-    local function respond(fields)
-      if epoch ~= generation or revision ~= state.revision then
-        return
+    local task = async.run("mentat extension UI", function()
+      async.await(vim.schedule)
+      local fields
+      if ui_request.method == "notify" then
+        local levels = { info = vim.log.levels.INFO, warning = vim.log.levels.WARN, error = vim.log.levels.ERROR }
+        vim.notify(ui_request.message or "", levels[ui_request.notifyType] or vim.log.levels.INFO)
+      elseif ui_request.method == "select" then
+        local choice = boundary.select(ui_request.options or {}, { prompt = ui_request.title or "Select" })
+        fields = choice == nil and { cancelled = true } or { value = choice }
+      elseif ui_request.method == "confirm" then
+        local title = ui_request.title or "Confirm"
+        if ui_request.message then
+          title = title .. ": " .. ui_request.message
+        end
+        local choice = boundary.select({ "Yes", "No" }, { prompt = title })
+        fields = choice == nil and { cancelled = true } or { confirmed = choice == "Yes" }
+      elseif ui_request.method == "input" or ui_request.method == "editor" then
+        local input = boundary.input({ prompt = (ui_request.title or "Input") .. ": ", default = ui_request.prefill or "" })
+        fields = input == nil and { cancelled = true } or { value = input }
+      elseif ui_request.method ~= "setStatus" and ui_request.method ~= "setWidget" and ui_request.method ~= "setTitle" and ui_request.method ~= "set_editor_text" then
+        fields = { cancelled = true }
       end
-      fields.type = "extension_ui_response"
-      fields.id = ui_request.id
-      send_raw(fields)
-    end
-    if ui_request.method == "notify" then
-      local levels = { info = vim.log.levels.INFO, warning = vim.log.levels.WARN, error = vim.log.levels.ERROR }
-      vim.notify(ui_request.message or "", levels[ui_request.notifyType] or vim.log.levels.INFO)
-    elseif ui_request.method == "select" then
-      vim.ui.select(ui_request.options or {}, { prompt = ui_request.title or "Select" }, function(choice)
-        respond(choice == nil and { cancelled = true } or { value = choice })
-      end)
-    elseif ui_request.method == "confirm" then
-      local title = ui_request.title or "Confirm"
-      if ui_request.message then
-        title = title .. ": " .. ui_request.message
+      if fields and epoch == generation and revision == state.revision then
+        fields.type = "extension_ui_response"
+        fields.id = ui_request.id
+        local ok, err = send_raw(fields)
+        if not ok then
+          terminate(err)
+        end
       end
-      vim.ui.select({ "Yes", "No" }, { prompt = title }, function(choice)
-        respond(choice == nil and { cancelled = true } or { confirmed = choice == "Yes" })
-      end)
-    elseif ui_request.method == "input" or ui_request.method == "editor" then
-      vim.ui.input({ prompt = (ui_request.title or "Input") .. ": ", default = ui_request.prefill or "" }, function(input)
-        respond(input == nil and { cancelled = true } or { value = input })
-      end)
-    elseif ui_request.method ~= "setStatus" and ui_request.method ~= "setWidget" and ui_request.method ~= "setTitle" and ui_request.method ~= "set_editor_text" then
-      respond({ cancelled = true })
-    end
+    end):detach()
+    ui_tasks[task] = true
+    task:on_complete(function(err)
+      ui_tasks[task] = nil
+      boundary.report(err)
+    end)
   end
 
   local function metadata_changed(prompt)
@@ -521,6 +576,19 @@ local function new_client()
     end
   end
 
+  local function settled(prompt, err, status)
+    if prompt.settled then
+      return
+    end
+    prompt.settled = true
+    prompt.error = err
+    prompt.status = status
+    prompt.metadata.total_ms = (uv.hrtime() - prompt.started) / 1e6
+    if prompt.wake then
+      prompt.wake()
+    end
+  end
+
   local function handle_event(event)
     local op = operation
     local prompt = op and op.prompt
@@ -552,11 +620,10 @@ local function new_client()
     elseif event.type == "agent_settled" then
       state.is_streaming = false
       state.is_compacting = false
-      if prompt and not prompt.settled then
-        settle_prompt(op)
-      else
-        changed()
+      if prompt and prompt.sent then
+        settled(prompt)
       end
+      changed()
     elseif event.type == "extension_error" then
       vim.notify("Pi extension error: " .. tostring(event.error), vim.log.levels.ERROR)
     elseif prompt and not prompt.settled then
@@ -593,7 +660,6 @@ local function new_client()
         return
       end
       pending[payload.id] = nil
-      close_timer(entry.timer)
       if operation == entry.op then
         entry.callback(payload)
       end
@@ -619,7 +685,7 @@ local function new_client()
         vim.schedule(function()
           if epoch == generation and id == job_id then
             local remaining = line_consumer(stdout_buffer, data, function(line)
-              if epoch == generation then
+              if epoch == generation and id == job_id then
                 handle_line(line)
               end
             end)
@@ -633,7 +699,7 @@ local function new_client()
         vim.schedule(function()
           if epoch == generation and id == job_id then
             local remaining = line_consumer(stderr_buffer, data, function(line)
-              if epoch == generation then
+              if epoch == generation and id == job_id then
                 vim.notify("Pi stderr: " .. line, vim.log.levels.WARN)
               end
             end)
@@ -670,7 +736,7 @@ local function new_client()
     return true
   end
 
-  local function ensure_ready(op, opts, on_done)
+  local function ensure_ready(op, opts)
     if type(opts) == "function" then
       opts = opts()
     end
@@ -697,31 +763,25 @@ local function new_client()
       selection_error = nil
       local ok, err = start_process(config)
       if not ok then
-        on_done(false, err)
-        return
+        return false, err
       end
     end
-    refresh(op, function(ok, err)
-      if not ok then
-        on_done(false, err)
-        return
-      end
-      if state.is_streaming or state.is_compacting then
-        on_done(false, "Pi is already processing a request")
-        return
-      end
-      if restore_selection then
-        restore(op, on_done)
-      elseif needs_defaults then
-        needs_defaults = false
-        apply_selection(op, config.default_selection or models.defaults(config), function(selected, selection_err)
-          selection_error = selection_err
-          on_done(selected, selection_err)
-        end)
-      else
-        on_done(selection_error == nil, selection_error)
-      end
-    end)
+    local ok, err = refresh(op)
+    if not ok then
+      return false, err
+    end
+    if state.is_streaming or state.is_compacting then
+      return false, "Pi is already processing a request"
+    end
+    if restore_selection then
+      return restore(op)
+    elseif needs_defaults then
+      needs_defaults = false
+      local selected, selection_err = apply_selection(op, config.default_selection or models.defaults(config))
+      selection_error = selection_err
+      return selected, selection_err
+    end
+    return selection_error == nil, selection_error
   end
 
   function client.ensure_started(opts, on_done)
@@ -729,37 +789,29 @@ local function new_client()
     if not op then
       return false, err
     end
-    schedule(op, function()
-      ensure_ready(op, opts, function(ok, start_err)
-        finish(op, ok, start_err)
-      end)
+    return launch(op, function()
+      return ensure_ready(op, opts)
     end)
-    return true
   end
 
-  settle_prompt = function(op, forced_error, forced_status)
+  local function settle_prompt(op)
     local prompt = op.prompt
-    if prompt.settled then
-      return
-    end
-    prompt.settled = true
-    prompt.metadata.total_ms = (uv.hrtime() - prompt.started) / 1e6
-    local err = forced_error or prompt.message_error or prompt.retry_error or prompt.compaction_error
-    local status = forced_status or prompt.message_status or prompt.compaction_status
+    local err = prompt.error or prompt.message_error or prompt.retry_error or prompt.compaction_error
+    local status = prompt.status or prompt.message_status or prompt.compaction_status
     if prompt.aborted then
       err = "Pi request aborted"
       status = "aborted"
     end
-    refresh(op, function(ok, refresh_err)
-      err = joined_error(err, not ok and refresh_err or nil)
-      restore(op, function(restored, restore_err)
-        err = joined_error(err, not restored and restore_err or nil)
-        if err and status ~= "aborted" then
-          status = "error"
-        end
-        finish_prompt(op, err, status)
-      end)
-    end)
+    local ok, refresh_err = refresh(op)
+    err = joined_error(err, not ok and refresh_err or nil)
+    if job_id then
+      local restored, restore_err = restore(op)
+      err = joined_error(err, not restored and restore_err or nil)
+    end
+    if err and status ~= "aborted" then
+      status = "error"
+    end
+    return prompt_result(op, err, status)
   end
 
   function client.prompt(message, on_chunk, on_done, opts)
@@ -768,60 +820,70 @@ local function new_client()
     if not op then
       return false, err
     end
-    op.prompt = {
+    local prompt = {
       started = uv.hrtime(),
       text = "",
       metadata = { models = {}, status = "pending" },
       on_chunk = on_chunk,
       on_metadata = opts.on_metadata,
     }
-    schedule(op, function()
-      ensure_ready(op, opts.start_config, function(ok, prepare_err)
-        if not ok then
-          finish_prompt(op, prepare_err)
-          return
+    op.prompt = prompt
+    return launch(op, function()
+      local ok, prepare_err = ensure_ready(op, opts.start_config)
+      if not ok then
+        return prompt_result(op, prepare_err)
+      end
+      if opts.override then
+        restore_selection = models.from_state(state)
+        local selected, selection_err = apply_selection(op, opts.override)
+        if not selected then
+          settled(prompt, selection_err, "error")
+          return settle_prompt(op)
         end
-        local function submit(selected, selection_err)
-          if not selected then
-            settle_prompt(op, selection_err, "error")
-            return
+      end
+      if not state.model then
+        settled(prompt, "No Pi model selected; check model availability and authentication", "error")
+        return settle_prompt(op)
+      end
+      local response, rpc_err = request(op, { type = "prompt", message = message }, true, true)
+      if rpc_err then
+        return prompt_result(op, rpc_err)
+      end
+      if not prompt.settled and not response.success then
+        settled(prompt, response.error or "Pi rejected the prompt", "error")
+      elseif not prompt.settled and not prompt.agent_started then
+        local idle_response, idle_err = request(op, { type = "get_state" }, false, true)
+        if idle_err then
+          return prompt_result(op, idle_err)
+        end
+        if not prompt.settled and not prompt.agent_started then
+          if not idle_response or not idle_response.success then
+            local failure = idle_err or (idle_response and idle_response.error) or "Failed to confirm prompt acceptance"
+            terminate(failure, nil, true)
+            return prompt_result(op, failure)
           end
-          if not state.model then
-            settle_prompt(op, "No Pi model selected; check model availability and authentication", "error")
-            return
+          local valid, state_err = update_state(idle_response.data)
+          if not valid then
+            terminate(state_err, nil, true)
+            return prompt_result(op, state_err)
+          elseif not state.is_streaming and not state.is_compacting then
+            settled(prompt, nil, "handled without a response")
           end
-          op.prompt.sent = true
-          request(op, { type = "prompt", message = message }, function(response)
-            if not response.success then
-              settle_prompt(op, response.error or "Pi rejected the prompt", "error")
-            elseif not op.prompt.agent_started and not op.prompt.settled then
-              request(op, { type = "get_state" }, function(idle_response)
-                if op.prompt.agent_started or op.prompt.settled then
-                  return
-                end
-                if not idle_response.success then
-                  terminate(idle_response.error or "Failed to confirm prompt acceptance")
-                  return
-                end
-                local valid, state_err = update_state(idle_response.data)
-                if not valid then
-                  terminate(state_err)
-                elseif not state.is_streaming and not state.is_compacting then
-                  settle_prompt(op, nil, "handled without a response")
-                end
-              end)
-            end
-          end, true)
         end
-        if opts.override then
-          restore_selection = models.from_state(state)
-          apply_selection(op, opts.override, submit)
-        else
-          submit(true)
-        end
-      end)
+      end
+      if not prompt.settled then
+        async.await(function(done)
+          prompt.wake = done
+          return {
+            close = function(_, callback)
+              prompt.wake = nil
+              callback()
+            end,
+          }
+        end)
+      end
+      return settle_prompt(op)
     end)
-    return true
   end
 
   function client.abort()
@@ -832,12 +894,22 @@ local function new_client()
     op.prompt.aborted = true
     if not op.prompt.agent_started or op.prompt.settled then
       terminate("Pi request aborted", "aborted")
-    else
-      request(op, { type = "abort" }, function(response)
-        if not response.success then
-          terminate(response.error or "Failed to abort Pi", "aborted")
+    elseif not op.abort_task then
+      local task = async.run("mentat Pi abort", function()
+        async.await(vim.schedule)
+        local response, err = request(op, { type = "abort" }, true)
+        if not response or not response.success then
+          terminate(err or (response and response.error) or "Failed to abort Pi", "aborted")
         end
-      end, true)
+      end):detach()
+      op.abort_task = task
+      task:on_complete(function(err)
+        on_main(function()
+          if err and err ~= "closed" and operation == op then
+            terminate(tostring(err), "aborted")
+          end
+        end)
+      end)
     end
     return true
   end
@@ -847,29 +919,24 @@ local function new_client()
     if not op then
       return false, err
     end
-    schedule(op, function()
-      refresh(op, function(ok, refresh_err)
-        if not ok then
-          finish(op, false, refresh_err)
-          return
-        end
-        if state.is_streaming or state.is_compacting then
-          finish(op, false, "Pi is already processing a request")
-          return
-        end
-        apply_selection(op, selection, function(selected, selection_err)
-          if selected then
-            restore_selection = nil
-            selection_error = nil
-          end
-          if not restore_selection then
-            state.selection = models.from_state(state)
-          end
-          finish(op, selected, selection_err, vim.deepcopy(state))
-        end)
-      end)
+    return launch(op, function()
+      local ok, refresh_err = refresh(op)
+      if not ok then
+        return false, refresh_err
+      end
+      if state.is_streaming or state.is_compacting then
+        return false, "Pi is already processing a request"
+      end
+      local selected, selection_err = apply_selection(op, selection)
+      if selected then
+        restore_selection = nil
+        selection_error = nil
+      end
+      if not restore_selection then
+        state.selection = models.from_state(state)
+      end
+      return selected, selection_err, vim.deepcopy(state)
     end)
-    return true
   end
 
   function client.set_model(provider, model_id, on_done)
@@ -885,39 +952,32 @@ local function new_client()
   end
 
   function client.get_state(on_done)
-    local op, err = begin("refreshing", function(ok, rpc_err, data)
-      on_done(ok and data or nil, rpc_err)
-    end)
+    local op, err = begin("refreshing", on_done)
     if not op then
       return false, err
     end
-    schedule(op, function()
-      refresh(op, function(ok, refresh_err)
-        finish(op, ok, refresh_err, vim.deepcopy(state))
-      end)
+    op.list = true
+    return launch(op, function()
+      local ok, refresh_err = refresh(op)
+      return ok and vim.deepcopy(state) or nil, refresh_err
     end)
-    return true
   end
 
   local function get_list(command, key, on_done)
-    local op, err = begin("listing", function(ok, rpc_err, data)
-      on_done(ok and data or nil, rpc_err)
-    end)
+    local op, err = begin("listing", on_done)
     if not op then
       return false, err
     end
-    schedule(op, function()
-      request(op, { type = command }, function(response)
-        local data = value(response.data)
-        local list = type(data) == "table" and data[key] or nil
-        if not response.success or type(list) ~= "table" then
-          finish(op, false, response.error or ("Pi returned invalid " .. key))
-        else
-          finish(op, true, nil, list)
-        end
-      end)
+    op.list = true
+    return launch(op, function()
+      local response, rpc_err = request(op, { type = command })
+      local data = response and value(response.data)
+      local list = type(data) == "table" and data[key] or nil
+      if not response or not response.success or type(list) ~= "table" then
+        return nil, rpc_err or (response and response.error) or ("Pi returned invalid " .. key)
+      end
+      return list
     end)
-    return true
   end
 
   function client.get_available_models(on_done)
@@ -932,40 +992,37 @@ local function new_client()
     return get_list("get_commands", "commands", on_done)
   end
 
+  local function switch(op, command)
+    local response, rpc_err = request(op, command, true)
+    local data = response and value(response.data)
+    if not response or not response.success or (type(data) == "table" and data.cancelled == true) then
+      return false, rpc_err or (response and response.error) or ("Pi " .. command.type .. " request was cancelled")
+    end
+    op.adopted_path = command.sessionPath
+    restore_selection = nil
+    resume_selection = nil
+    selection_error = nil
+    return refresh(op)
+  end
+
   local function session_command(command, on_done, opts, reset_defaults)
     local op, err = begin("switching", on_done)
     if not op then
       return false, err
     end
-    schedule(op, function()
-      ensure_ready(op, opts, function(ok, start_err)
-        if not ok and (not state.ready or state.is_streaming or state.is_compacting) then
-          finish(op, false, start_err)
-          return
-        end
-        request(op, command, function(response)
-          local data = value(response.data)
-          if not response.success or (type(data) == "table" and data.cancelled == true) then
-            finish(op, false, response.error or ("Pi " .. command.type .. " request was cancelled"))
-            return
-          end
-          restore_selection = nil
-          resume_selection = nil
-          selection_error = nil
-          refresh(op, function(refreshed, refresh_err)
-            if not refreshed or not reset_defaults then
-              finish(op, refreshed, refresh_err)
-              return
-            end
-            apply_selection(op, active_config.default_selection or models.defaults(active_config), function(selected, selection_err)
-              selection_error = selection_err
-              finish(op, selected, selection_err)
-            end)
-          end)
-        end, true)
-      end)
+    return launch(op, function()
+      local ok, start_err = ensure_ready(op, opts)
+      if not ok and (not state.ready or state.is_streaming or state.is_compacting) then
+        return false, start_err
+      end
+      local switched, switch_err = switch(op, command)
+      if not switched or not reset_defaults then
+        return switched, switch_err
+      end
+      local selected, selection_err = apply_selection(op, active_config.default_selection or models.defaults(active_config))
+      selection_error = selection_err
+      return selected, selection_err
     end)
-    return true
   end
 
   function client.new_session(on_done, opts)
@@ -985,8 +1042,27 @@ local function new_client()
     if not op then
       return false, err
     end
-    schedule(op, function()
-      local config = type(opts.start_config) == "function" and opts.start_config() or opts.start_config
+    opts = opts or {}
+    local scratch = new_client()
+    local unused_path
+    local clone_source
+    local cloning = false
+    op.cleanup = function(done)
+      local path = unused_path or (cloning and scratch.state.session_file)
+      scratch.stop()
+      if type(path) == "string" and path ~= "" and path ~= source and path ~= clone_source and path ~= op.adopted_path then
+        uv.fs_unlink(path, function(unlink_err)
+          if unlink_err and not unlink_err:find("ENOENT", 1, true) then
+            boundary.report(unlink_err)
+          end
+          done()
+        end)
+      else
+        done()
+      end
+    end
+    return launch(op, function()
+      local config = type(opts.start_config) == "function" and opts.start_config() or opts.start_config or {}
       local clone_config = vim.deepcopy(config)
       clone_config.session_file = source
       clone_config.no_session = false
@@ -994,59 +1070,40 @@ local function new_client()
       clone_config.no_skills = true
       clone_config.no_prompt_templates = true
       clone_config.no_themes = true
-      local scratch = new_client()
-      op.cleanup = scratch.stop
-      scratch.ensure_started(clone_config, function(started, start_err)
-        if operation ~= op then
-          return
-        end
-        if not started then
-          finish(op, false, start_err)
-          return
-        end
-        scratch.clone_session(function(cloned, clone_err)
-          if operation ~= op then
-            return
-          end
-          if not cloned then
-            finish(op, false, clone_err)
-            return
-          end
-          local path = scratch.state.session_file
-          scratch.stop()
-          if type(path) ~= "string" or path == source then
-            finish(op, false, "Pi did not create a cloned session file")
-            return
-          end
-          local prepare_err = opts.prepare_clone and opts.prepare_clone(path)
-          if prepare_err then
-            vim.fn.delete(path)
-            finish(op, false, prepare_err)
-            return
-          end
-          ensure_ready(op, config, function(start_ok, ready_err)
-            if not start_ok then
-              finish(op, false, ready_err)
-              return
-            end
-            request(op, { type = "switch_session", sessionPath = path }, function(response)
-              local data = value(response.data)
-              if not response.success or (type(data) == "table" and data.cancelled == true) then
-                finish(op, false, response.error or "Pi switch_session request was cancelled")
-                return
-              end
-              restore_selection = nil
-              resume_selection = nil
-              selection_error = nil
-              refresh(op, function(ok, refresh_err)
-                finish(op, ok, refresh_err)
-              end)
-            end, true)
-          end)
-        end)
+      local started, start_err = boundary.call(function(done)
+        return scratch.ensure_started(clone_config, done)
       end)
+      if not started then
+        return false, start_err
+      end
+      clone_source = scratch.state.session_file
+      cloning = true
+      local cloned, clone_err = boundary.call(function(done)
+        return scratch.clone_session(done)
+      end)
+      if not cloned then
+        return false, clone_err
+      end
+      local path = scratch.state.session_file
+      scratch.stop()
+      if type(path) ~= "string" or path == "" or path == source or path == clone_source then
+        return false, "Pi did not create a cloned session file"
+      end
+      unused_path = path
+      local prepare_err = opts.prepare_clone and opts.prepare_clone(path)
+      if prepare_err then
+        return false, prepare_err
+      end
+      local ready, ready_err = ensure_ready(op, config)
+      if not ready then
+        return false, ready_err
+      end
+      local switched, switch_err = switch(op, { type = "switch_session", sessionPath = path })
+      if switched or state.session_file == path then
+        unused_path = nil
+      end
+      return switched, switch_err
     end)
-    return true
   end
 
   return client

@@ -1,6 +1,9 @@
 local lsp = require("mentat.lsp")
+local boundary = require("mentat.async")
+local fs = require("mentat.fs")
+local async = vim.async
 
-local uv = vim.uv or vim.loop
+local uv = vim.uv
 
 local M = {
   state = {
@@ -11,6 +14,7 @@ local M = {
 }
 
 local server = nil
+local connections = {}
 local cleanup_registered = false
 
 local function get_repo_root()
@@ -168,16 +172,10 @@ local function get_buffer_snapshot(params, repo_root)
     return nil, "No current buffer"
   end
 
-  local handle = io.open(abs_path, "r")
-  if not handle then
+  local all_lines = fs.read_lines(abs_path)
+  if not all_lines then
     return nil, "Cannot read file: " .. abs_path
   end
-
-  local all_lines = {}
-  for line in handle:lines() do
-    table.insert(all_lines, line)
-  end
-  handle:close()
   local end_line = limit and math.min(#all_lines, offset + limit - 1) or #all_lines
   local lines = vim.list_slice(all_lines, offset, end_line)
 
@@ -440,48 +438,89 @@ local handlers = {
   end,
 }
 
-local function send_response(client, payload)
-  local encoded = vim.json.encode(payload) .. "\n"
-  client:write(encoded)
-  client:shutdown(function()
-    client:close()
-  end)
+local function close_connection(connection)
+  if connection.closed then
+    return
+  end
+  connection.closed = true
+  connections[connection] = nil
+  if connection.task and not connection.task:completed() then
+    connection.task:close()
+  end
+  if not connection.client:is_closing() then
+    connection.client:read_stop()
+    connection.client:close()
+  end
 end
 
-local function handle_request(client, raw)
+local function send_response(connection, payload)
+  local client = connection.client
+  if connection.closed or connection.sent or client:is_closing() then
+    return
+  end
+  connection.sent = true
+  local encoded = vim.json.encode(payload) .. "\n"
+  local request = client:write(encoded, function(err)
+    if err then
+      close_connection(connection)
+    elseif not connection.closed and not client:is_closing() then
+      local shutdown = client:shutdown(function()
+        close_connection(connection)
+      end)
+      if not shutdown then
+        close_connection(connection)
+      end
+    end
+  end)
+  if not request then
+    close_connection(connection)
+  end
+end
+
+local function handle_request(raw, repo_root)
   local ok, request = pcall(vim.json.decode, raw)
   if not ok or type(request) ~= "table" then
-    send_response(client, { ok = false, error = "Invalid JSON request" })
-    return
+    return { ok = false, error = "Invalid JSON request" }
   end
 
   local handler = handlers[request.method]
   if not handler then
-    send_response(client, { ok = false, error = "Unknown method: " .. tostring(request.method) })
-    return
+    return { ok = false, error = "Unknown method: " .. tostring(request.method) }
   end
 
-  local repo_root = M.state.repo_root or get_repo_root()
   local status, result, err = pcall(handler, request.params or {}, repo_root)
+  async.checkpoint()
   if not status then
-    send_response(client, { ok = false, error = tostring(result) })
-    return
+    return { ok = false, error = tostring(result) }
   end
-
   if not result then
-    send_response(client, { ok = false, error = tostring(err or "Unknown editor bridge error") })
-    return
+    return { ok = false, error = tostring(err or "Unknown editor bridge error") }
   end
-
-  send_response(client, { ok = true, result = result })
+  return { ok = true, result = result }
 end
 
-local function dispatch_request(client, raw)
-  vim.schedule(function()
-    if client:is_closing() then
+local function dispatch_request(connection, raw)
+  connection.dispatched = true
+  local task = async.run("mentat bridge", function()
+    async.await(vim.schedule)
+    if not connection.closed then
+      return handle_request(raw, connection.repo_root)
+    end
+  end):detach()
+  connection.task = task
+  task:on_complete(function(err, payload)
+    if connection.closed then
       return
     end
-    handle_request(client, raw)
+    if err then
+      if err ~= "closed" then
+        send_response(connection, { ok = false, error = tostring(err) })
+      else
+        close_connection(connection)
+      end
+    elseif payload then
+      send_response(connection, payload)
+    end
   end)
 end
 
@@ -490,17 +529,19 @@ local function stop_server()
     server:close()
     server = nil
   end
-
+  for connection in pairs(connections) do
+    close_connection(connection)
+  end
   M.state.repo_root = nil
   M.state.port = nil
 end
 
 local function create_server(port)
   local handle = uv.new_tcp()
-  local ok, err = pcall(handle.bind, handle, M.state.host, port)
-  if not ok then
+  local ok, result, err = pcall(handle.bind, handle, M.state.host, port)
+  if not ok or not result then
     handle:close()
-    return nil, err
+    return nil, err or result
   end
   return handle
 end
@@ -538,34 +579,45 @@ function M.ensure_started(repo_root)
     error(bind_err)
   end
 
-  server:listen(128, function(err)
+  local listener = server
+  listener:listen(128, function(err)
+    if listener ~= server then
+      return
+    end
     if err then
-      vim.schedule(function()
-        vim.notify("Mentat editor bridge error: " .. tostring(err), vim.log.levels.ERROR)
-      end)
+      boundary.report("Editor bridge: " .. tostring(err))
       return
     end
 
     local client = uv.new_tcp()
-    server:accept(client)
+    local connection = { client = client, repo_root = repo_root }
+    connections[connection] = true
+    if not listener:accept(client) then
+      close_connection(connection)
+      return
+    end
 
     local buffer = ""
     client:read_start(function(read_err, chunk)
-      if read_err then
-        client:close()
+      if connection.closed then
         return
       end
-
+      if read_err then
+        close_connection(connection)
+        return
+      end
       if not chunk then
-        if buffer ~= "" then
+        if not connection.dispatched and buffer ~= "" then
           client:read_stop()
-          dispatch_request(client, buffer)
+          dispatch_request(connection, buffer)
         else
-          client:close()
+          close_connection(connection)
         end
         return
       end
-
+      if connection.dispatched then
+        return
+      end
       buffer = buffer .. chunk
       while true do
         local newline = buffer:find("\n", 1, true)
@@ -575,8 +627,7 @@ function M.ensure_started(repo_root)
         local line = buffer:sub(1, newline - 1)
         buffer = buffer:sub(newline + 1)
         if line ~= "" then
-          client:read_stop()
-          dispatch_request(client, line)
+          dispatch_request(connection, line)
           return
         end
       end

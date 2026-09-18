@@ -158,14 +158,14 @@ end, { desc = "Branch Mentat conversation" })
 
 vim.keymap.set("v", "<leader>mb", ":MentatBranch<CR>", { desc = "Branch with selection" })
 
--- Session Persistence
 local group = vim.api.nvim_create_augroup("MentatSession", { clear = true })
 
 vim.api.nvim_create_autocmd("VimLeavePre", {
   group = group,
   callback = function()
     local buffer = require("mentat.buffer")
-    buffer.save_state()
+    require("mentat").stop()
+    buffer.save_state_sync()
     buffer.release_instance_claim()
   end,
 })
@@ -178,8 +178,14 @@ vim.api.nvim_create_autocmd("SessionLoadPost", {
 })
 
 vim.api.nvim_create_user_command("MentatSaveState", function()
-  require("mentat.buffer").save_state()
-  vim.notify("Mentat state saved", vim.log.levels.INFO)
+  local task = require("mentat.buffer").save_state()
+  if task then
+    task:on_complete(function(err, ok)
+      if not err and ok then
+        vim.notify("Mentat state saved", vim.log.levels.INFO)
+      end
+    end)
+  end
 end, { desc = "Save Mentat state to file" })
 
 vim.api.nvim_create_user_command("MentatLoadState", function()

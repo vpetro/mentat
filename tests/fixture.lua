@@ -19,6 +19,9 @@ function M.new()
     fail = {},
     sessions = {},
     clients = {},
+    tasks = {},
+    cleanups = {},
+    patches = {},
     notices = {},
     catalog = vim.deepcopy(M.catalog),
     default = { model = M.catalog[3], thinkingLevel = "high" },
@@ -46,6 +49,23 @@ function M.new()
   end
   vim.fn.executable = function()
     return f.missing_executable and 0 or 1
+  end
+
+  function f.patch(object, key, replacement)
+    local original = object[key]
+    f.patches[#f.patches + 1] = function() object[key] = original end
+    object[key] = replacement
+    return original
+  end
+
+  function f.cleanup(action)
+    f.cleanups[#f.cleanups + 1] = action
+  end
+
+  function f.task(work)
+    local task = vim.async.run(work)
+    f.tasks[#f.tasks + 1] = task
+    return task
   end
 
   function f.levels(model)
@@ -186,6 +206,8 @@ function M.new()
         f.persist(job.state)
         data = { cancelled = false }
       end
+    elseif command.type == "extension_ui_response" then
+      return
     else
       error("Unexpected RPC command: " .. command.type)
     end
@@ -207,7 +229,20 @@ function M.new()
       end
     end
     local id = #f.jobs + 1
-    local state = session_file and f.sessions[session_file] and vim.deepcopy(f.sessions[session_file]) or new_state()
+    local saved = session_file and f.sessions[session_file]
+    if session_file and not saved and vim.fn.filereadable(session_file) == 1 then
+      local ok, header = pcall(vim.json.decode, vim.fn.readfile(session_file, "", 1)[1] or "")
+      if ok and type(header) == "table" then
+        for _, candidate in pairs(f.sessions) do
+          if candidate.sessionId == header.id then
+            saved = vim.deepcopy(candidate)
+            saved.sessionFile = session_file
+            break
+          end
+        end
+      end
+    end
+    local state = saved and vim.deepcopy(saved) or new_state()
     if no_session then
       state.sessionFile = vim.NIL
     end
@@ -249,7 +284,7 @@ function M.new()
 
   function f.flush()
     local drained = false
-    vim.defer_fn(function() drained = true end, 5)
+    vim.defer_fn(function() drained = true end, 25)
     vim.wait(1000, function() return drained end, 1)
   end
 
@@ -376,6 +411,15 @@ function M.new()
   end
 
   function f.close()
+    for _, task in ipairs(f.tasks) do
+      task:close()
+    end
+    for index = #f.cleanups, 1, -1 do
+      f.cleanups[index]()
+    end
+    if package.loaded["mentat.editor_bridge"] then
+      package.loaded["mentat.editor_bridge"].stop()
+    end
     for _, client in ipairs(f.clients) do
       client.stop()
     end
@@ -384,7 +428,7 @@ function M.new()
     end
     vim.cmd("silent! only!")
     for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-      if vim.bo[buf].buftype == "nofile" then
+      if vim.bo[buf].buftype == "nofile" or vim.api.nvim_buf_get_name(buf):sub(1, #f.root) == f.root then
         vim.api.nvim_buf_delete(buf, { force = true })
       end
     end
@@ -393,7 +437,11 @@ function M.new()
         f.exit(id)
       end
     end
+    f.wait(function() return vim.async._inspect_tree() == "" end)
     f.flush()
+    for index = #f.patches, 1, -1 do
+      f.patches[index]()
+    end
     for name, original in pairs(originals) do
       vim.fn[name] = original
     end
@@ -406,7 +454,7 @@ function M.new()
         package.loaded[name] = nil
       end
     end
-    for _, name in ipairs({ "MentatRuntime", "MentatSession", "MentatModels" }) do
+    for _, name in ipairs({ "MentatRuntime", "MentatSession", "MentatModels", "MentatEditorBridge", "MentatReview" }) do
       if vim.fn.exists("#" .. name) == 1 then
         vim.api.nvim_del_augroup_by_name(name)
       end

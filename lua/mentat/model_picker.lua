@@ -1,4 +1,6 @@
 local models = require("mentat.models")
+local boundary = require("mentat.async")
+local async = vim.async
 local M = {}
 local targets = {}
 local windows = {}
@@ -60,6 +62,9 @@ function M.detach(buf)
   local target = targets[buf]
   targets[buf] = nil
   if target then
+    if target.picker_task then
+      target.picker_task:close()
+    end
     if target.unsubscribe then
       target.unsubscribe()
     end
@@ -86,6 +91,9 @@ function M.attach(buf, client, name)
   if target.unsubscribe then
     target.unsubscribe()
   end
+  if target.picker_task then
+    target.picker_task:close()
+  end
   target.epoch = target.epoch + 1
   target.client = client
   target.name = name or "Mentat"
@@ -99,8 +107,12 @@ function M.target(buf)
 end
 
 function M.invalidate(buf)
-  if targets[buf] then
-    targets[buf].epoch = targets[buf].epoch + 1
+  local target = targets[buf]
+  if target then
+    target.epoch = target.epoch + 1
+    if target.picker_task then
+      target.picker_task:close()
+    end
   end
 end
 
@@ -120,12 +132,44 @@ function M.pick(kind)
     notify("Pi is busy; wait for the current operation to settle")
     return
   end
+  if target.picker_task then
+    target.picker_task:close()
+  end
   local epoch = target.epoch
+  local root = mentat.get_repo_root()
   local function valid()
     return targets[target.bufnr] == target and target.epoch == epoch and target.client == client and vim.api.nvim_buf_is_loaded(target.bufnr)
   end
-  local function show(items)
+  local task = async.run("mentat " .. kind .. " picker", function()
     if not valid() then
+      return
+    end
+    local ok, err = boundary.call(function(done)
+      if client == mentat.get_client() then
+        return mentat.prepare(done, root)
+      end
+      return client.ensure_started(nil, done)
+    end)
+    if not valid() then
+      return
+    end
+    if not ok then
+      notify(err, vim.log.levels.ERROR)
+      if not client.state.ready or client.is_busy() then
+        return
+      end
+    end
+    if kind == "thinking" and not client.state.model then
+      notify("Select an available model first")
+      return
+    end
+    local list = kind == "model" and client.get_available_models or client.get_available_thinking_levels
+    local items, list_err = boundary.call(list)
+    if not valid() then
+      return
+    end
+    if not items then
+      notify(list_err, vim.log.levels.ERROR)
       return
     end
     if #items == 0 then
@@ -156,80 +200,43 @@ function M.pick(kind)
         labels[level] = (current.thinking == level and "* " or "  ") .. level
       end
     end
-    vim.ui.select(items, {
+    local choice = boundary.select(items, {
       kind = "mentat_" .. kind,
       prompt = "Mentat " .. kind .. " (" .. models.label(current) .. "):",
       format_item = function(item)
         return labels[item]
       end,
-    }, function(choice)
-      if choice == nil or not valid() then
-        return
-      end
-      if revision ~= client.state.revision or session_id ~= client.state.session_id or client.is_busy() then
-        notify("The conversation changed; reopen the picker")
-        return
-      end
-      local function selected(ok, err)
-        if not valid() then
-          return
-        end
-        local label = models.label(models.from_state(client.state))
-        if ok then
-          notify("Mentat: " .. label, vim.log.levels.INFO)
-        else
-          notify(tostring(err) .. " (last confirmed: " .. label .. ")", vim.log.levels.ERROR)
-        end
-      end
-      local accepted, err
+    })
+    if choice == nil or not valid() then
+      return
+    end
+    if revision ~= client.state.revision or session_id ~= client.state.session_id or client.is_busy() then
+      notify("The conversation changed; reopen the picker")
+      return
+    end
+    local selected, selection_err = boundary.call(function(done)
       if kind == "model" then
-        accepted, err = client.set_model(choice.provider, choice.id, selected)
-      else
-        accepted, err = client.set_thinking_level(choice, selected)
+        return client.set_model(choice.provider, choice.id, done)
       end
-      if not accepted then
-        notify(err)
-      end
+      return client.set_thinking_level(choice, done)
     end)
-  end
-  local function prepared(ok, err)
-    if not valid() then
-      return
-    end
-    if not ok then
-      notify(err, vim.log.levels.ERROR)
-      if not client.state.ready then
-        return
-      end
-    end
-    if kind == "thinking" and not client.state.model then
-      notify("Select an available model first")
-      return
-    end
-    local list = kind == "model" and client.get_available_models or client.get_available_thinking_levels
-    local accepted, list_err = list(function(items, rpc_err)
-      if not valid() then
-        return
-      end
-      if not items then
-        notify(rpc_err, vim.log.levels.ERROR)
+    if valid() then
+      local label = models.label(models.from_state(client.state))
+      if selected then
+        notify("Mentat: " .. label, vim.log.levels.INFO)
       else
-        show(items)
+        notify(tostring(selection_err) .. " (last confirmed: " .. label .. ")", vim.log.levels.ERROR)
       end
-    end)
-    if not accepted then
-      notify(list_err)
     end
-  end
-  local accepted, err
-  if client == mentat.get_client() then
-    accepted, err = mentat.prepare(prepared)
-  else
-    accepted, err = client.ensure_started(nil, prepared)
-  end
-  if not accepted then
-    notify(err)
-  end
+  end):detach()
+  target.picker_task = task
+  task:on_complete(function(err)
+    if target.picker_task == task then
+      target.picker_task = nil
+    end
+    boundary.report(err)
+  end)
+  return task
 end
 
 vim.api.nvim_create_autocmd("BufWinLeave", {
