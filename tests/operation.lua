@@ -92,7 +92,7 @@ return function(test, eq, contains)
     f.wait(function() return #f.held == 1 end)
     local ok, err = client.abort()
     eq(ok, false)
-    contains(err, "cannot be cancelled")
+    eq(err, "This operation cannot be cancelled. Wait for it to finish.")
     eq(client.status().phase, "starting")
     eq(client.status().kind, "listing")
     f.hold.get_available_models = nil
@@ -210,13 +210,25 @@ return function(test, eq, contains)
     f.emit(1, { type = "tool_execution_update", toolCallId = "sub-1", toolName = "subagent", args = {}, partialResult = {
       content = { { type = "text", text = "Parallel: 1/2 done, 1 running..." } },
       details = { mode = "parallel", results = {
-        { agent = "first", exitCode = 0, usage = { turns = 1 } },
+        { agent = "first", exitCode = 0, completed = true, usage = { turns = 1 } },
         { agent = "second", exitCode = -1, usage = { turns = 0 } },
       } },
     } })
     f.flush()
     text = operation.render(client.status(), "Mentat")
-    contains(text, "\nfirst: done (1 turn)\nsecond: running")
+    contains(text, "\nfirst: finished (1 turn)\nsecond: running")
+    f.emit(1, { type = "tool_execution_update", toolCallId = "sub-1", toolName = "subagent", partialResult = {
+      content = { { type = "text", text = "Parallel: 3/4 done, 1 running..." } },
+      details = { mode = "parallel", results = {
+        { agent = "first", exitCode = 0, completed = true, usage = { turns = 1 } },
+        { agent = "second", exitCode = vim.NIL, signal = "SIGTERM", errorMessage = "Subagent was aborted.", completed = false, usage = { turns = 1 } },
+        { agent = "third", exitCode = vim.NIL, errorMessage = "Subagent terminated by SIGKILL.", completed = true, usage = { turns = 2 } },
+        { agent = "fourth", exitCode = -1, errorMessage = "fixture provider failure", usage = { turns = 1 } },
+      } },
+    } })
+    f.flush()
+    text = operation.render(client.status(), "Mentat")
+    contains(text, "\nfirst: finished (1 turn)\nsecond: cancelled (1 turn)\nthird: failed (2 turns)\nfourth: running (1 turn)")
     f.emit(1, { type = "tool_execution_update", toolCallId = "sub-1", toolName = "subagent", partialResult = { content = {}, details = { results = "invalid" } } })
     f.flush()
     contains(operation.render(client.status(), "Mentat"), "Subagent progress is unavailable.")
@@ -226,6 +238,87 @@ return function(test, eq, contains)
     eq(run.completions, 1)
     eq(client.status().tools, {})
     eq(operation.render(client.status(), "Mentat"), "Mentat: Idle | Model: openai/reasoner | Thinking: medium")
+  end)
+
+  test("subagent child status reports only what the tool's result fields establish", function()
+    local operation = require("mentat.operation")
+    local function status(result)
+      local lines = operation.subagent_progress({ details = { results = { result } } })
+      return lines and lines[1]
+    end
+    eq(status({ agent = "a", exitCode = -1 }), "a: running")
+    eq(status({ agent = "a", exitCode = -1, completed = true }), "a: running")
+    eq(status({ agent = "a", exitCode = -1, errorMessage = "fixture provider failure", usage = { turns = 3 } }), "a: running (3 turns)")
+    eq(status({ agent = "a", exitCode = 0, completed = true }), "a: finished")
+    eq(status({ agent = "a", exitCode = 0, completed = true, errorMessage = "" }), "a: finished")
+    eq(status({ agent = "a", exitCode = 0, completed = true, errorMessage = vim.NIL, usage = { turns = 1 } }), "a: finished (1 turn)")
+    eq(status({ agent = "a", exitCode = 0 }), "a: status unavailable")
+    eq(status({ agent = "a", exitCode = 0, completed = vim.NIL }), "a: status unavailable")
+    eq(status({ agent = "a", completed = true }), "a: status unavailable")
+    eq(status({ agent = "a", exitCode = "0", completed = true }), "a: status unavailable")
+    eq(status({ agent = "a", exitCode = true, errorMessage = "Subagent was aborted." }), "a: status unavailable")
+    eq(status({ agent = "a", exitCode = 0, completed = false }), "a: failed")
+    eq(status({ agent = "a", exitCode = 7, completed = true }), "a: failed")
+    eq(status({ agent = "a", exitCode = vim.NIL }), "a: failed")
+    eq(status({ agent = "a", exitCode = vim.NIL, signal = "SIGTERM", completed = true }), "a: failed")
+    eq(status({ agent = "a", exitCode = 0, completed = true, errorMessage = "Subagent returned an empty final assistant response." }), "a: failed")
+    eq(status({ agent = "a", exitCode = 1, errorMessage = "Subagent process error: spawn pi ENOENT" }), "a: failed")
+    eq(status({ agent = "a", exitCode = vim.NIL, errorMessage = "Subagent was aborted.", completed = false }), "a: cancelled")
+    eq(status({ agent = "a", exitCode = 0, errorMessage = "Subagent was aborted.", completed = true }), "a: cancelled")
+    eq(status({ agent = "a", exitCode = vim.NIL, errorMessage = "Subagent was aborted before startup." }), "a: cancelled")
+    eq(status({ agent = "a", exitCode = vim.NIL, errorMessage = "Subagent was aborted.\nSubagent stdin error: EPIPE" }), "a: cancelled")
+    eq(status({ agent = "a", exitCode = vim.NIL, errorMessage = "The Subagent was aborted." }), "a: failed")
+    eq(status({ exitCode = 0, completed = true }), nil)
+    eq(status("programmer"), nil)
+    eq(operation.subagent_progress({ details = { results = {} } }), nil)
+    eq(operation.subagent_progress({ details = { results = vim.NIL } }), nil)
+    eq(operation.subagent_progress(vim.NIL), nil)
+    local decoded = vim.json.decode('{"details":{"results":[{"agent":"a","exitCode":null,"errorMessage":"Subagent was aborted."},{"agent":"b","exitCode":0,"completed":null},{"agent":"c","exitCode":0,"completed":true,"usage":{"turns":2}}]}}')
+    eq(operation.subagent_progress(decoded), { "a: cancelled", "b: status unavailable", "c: finished (2 turns)" })
+  end)
+
+  test("a rejected or unsent abort stops Pi, reports the failure once, and recovers on the next request", function(f)
+    for _, failure in ipairs({
+      { setup = function() f.fail.abort = "abort rejected by fixture" end, error = "abort rejected by fixture", aborts = 1 },
+      { setup = function() f.send_error = true end, teardown = function() f.send_error = nil end, error = "Failed to send command to Pi", aborts = 0 },
+    }) do
+      local client = configured(f)
+      local job = #f.jobs
+      local run = submit(f, client)
+      f.start_message(job)
+      f.text(job, "partial answer")
+      f.flush()
+      failure.setup()
+      local commands = #f.commands
+      assert(client.abort())
+      eq(client.status().phase, "cancelling")
+      f.wait(function() return run.completions == 1 end)
+      eq(run.text, "partial answer")
+      eq(run.error, failure.error)
+      eq(run.metadata.status, "aborted")
+      eq(f.count("abort", commands + 1), failure.aborts)
+      eq(f.jobs[job].stopped, true)
+      eq(client.is_busy(), false)
+      eq(client.state.ready, false)
+      eq(client.status(), { phase = "idle", ready = false, model = f.catalog[1], thinking = "medium", tools = {} })
+      local ok, err = client.abort()
+      eq(ok, false)
+      eq(err, "Nothing is running.")
+      f.flush()
+      eq(run.completions, 1)
+      if failure.teardown then
+        failure.teardown()
+      end
+      f.fail.abort = nil
+      local next_run = submit(f, client)
+      eq(#f.jobs, job + 1)
+      eq(f.jobs[job + 1].stopped, nil)
+      f.complete(job + 1)
+      eq(next_run.metadata.status, "complete")
+      eq(client.state.model.id, "reasoner")
+      eq(client.state.thinking_level, "medium")
+      eq(run.completions, 1)
+    end
   end)
 
   test("Cancel and Status commands act on the focused conversation without starting Pi", function(f)

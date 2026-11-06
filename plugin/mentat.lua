@@ -38,11 +38,11 @@ vim.keymap.set("n", "<leader>mr", "<Cmd>MentatThinking<CR>", { desc = "Select Me
 
 vim.api.nvim_create_user_command("MentatCancel", function()
   require("mentat.operation").cancel()
-end, { desc = "Cancel this conversation's current request" })
+end, { desc = "Cancel the current request" })
 
 vim.api.nvim_create_user_command("MentatStatus", function()
   require("mentat.operation").status()
-end, { desc = "Show this conversation's current operation" })
+end, { desc = "Show the current operation" })
 
 vim.keymap.set("n", "<leader>mx", "<Cmd>MentatCancel<CR>", { desc = "Cancel Mentat request" })
 vim.keymap.set("n", "<leader>mi", "<Cmd>MentatStatus<CR>", { desc = "Show Mentat status" })

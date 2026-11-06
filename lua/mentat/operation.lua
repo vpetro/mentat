@@ -42,6 +42,27 @@ local function tool_label(tool)
   return label
 end
 
+local function child_status(result)
+  local exit_code = result.exitCode
+  if exit_code == -1 then
+    return "running"
+  end
+  if type(exit_code) ~= "number" and exit_code ~= vim.NIL then
+    return "status unavailable"
+  end
+  local message = result.errorMessage
+  if type(message) == "string" and message ~= "" then
+    return message:find("^Subagent was aborted") and "cancelled" or "failed"
+  end
+  if exit_code ~= 0 or result.completed == false then
+    return "failed"
+  end
+  if result.completed == true then
+    return "finished"
+  end
+  return "status unavailable"
+end
+
 function M.subagent_progress(partial)
   local details = type(partial) == "table" and partial.details or nil
   local results = type(details) == "table" and details.results or nil
@@ -51,7 +72,7 @@ function M.subagent_progress(partial)
   local lines = {}
   for _, result in ipairs(results) do
     if type(result) == "table" and type(result.agent) == "string" then
-      local line = result.agent .. ": " .. (result.exitCode == -1 and "running" or "done")
+      local line = result.agent .. ": " .. child_status(result)
       local turns = type(result.usage) == "table" and tonumber(result.usage.turns) or nil
       if turns and turns > 0 then
         line = line .. string.format(" (%d turn%s)", turns, turns == 1 and "" or "s")
@@ -104,7 +125,7 @@ function M.cancel()
   if client then
     ok, err = client.abort()
   else
-    ok, err = false, "The current operation cannot be cancelled; wait for it to settle."
+    ok, err = false, "This operation cannot be cancelled. Wait for it to finish."
   end
   if ok then
     vim.notify("Cancellation requested.", vim.log.levels.INFO)

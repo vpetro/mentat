@@ -956,7 +956,7 @@ local function new_client()
     end
     local prompt = op.prompt
     if not prompt or prompt.settled then
-      return false, "The current operation cannot be cancelled; wait for it to settle."
+      return false, "This operation cannot be cancelled. Wait for it to finish."
     end
     if prompt.aborted then
       return true
