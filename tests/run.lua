@@ -20,6 +20,7 @@ require("lsp")(test, eq, contains)
 require("bridge")(test, eq, contains)
 require("transport")(test, eq, contains)
 require("transport_async")(test, eq, contains)
+require("operation")(test, eq, contains)
 require("ui")(test, eq, contains)
 require("workflows")(test, eq, contains)
 

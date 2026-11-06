@@ -9,6 +9,8 @@ Mentat runs Pi conversations in Neovim. This version uses the Pi 0.85.1 RPC cont
 | `:MentatModel` | `<leader>mm` | Select a model from Pi's available catalog. |
 | `:MentatThinking` | `<leader>mr` | Select a supported thinking level for the current model. |
 | `:MentatPromote` | `<leader>mp` | Resend the last prompt with `big` in the current conversation. |
+| `:MentatCancel` | `<leader>mx` | Cancel the current request in this conversation. |
+| `:MentatStatus` | `<leader>mi` | Show the current operation in this conversation. |
 
 The selectors target the focused branch, or the main conversation when invoked from an ordinary editor buffer. They capture that target before opening the picker. Model entries show provider/model IDs, the current choice, and matching configured preset labels. A model change can adjust the thinking level; the winbar shows the confirmed result.
 
@@ -19,6 +21,14 @@ In a conversation buffer, Enter uses its selected model and thinking level on ev
 Selection is conversation-local. A branch inherits the main conversation's settings, then changes independently. Restored sessions retain their selection. `:MentatClear` starts a new main conversation with the configured defaults. Runtime selection does not change the setup table or Pi's global defaults, and does not restart Pi.
 
 Selectors and additional sends are rejected while a request is preparing, streaming, retrying, compacting, or restoring its normal settings. A rejected send leaves the draft intact. A picker opened before a send, session change, or buffer close must be reopened before it can apply a choice.
+
+## Cancel and Status
+
+Use Cancel to stop the current operation without restarting Mentat. The conversation and any partial response remain available. Use Status to inspect the current operation while it is running. Status shows the available execution phase, elapsed time, and current tool.
+
+Cancel and Status act on the focused branch, or on the main conversation from any other buffer. Cancel applies to requests. During generation, tool execution, and compaction it sends Pi's abort; the response ends with `Status: aborted` and keeps the text received so far. A cancel during request preparation takes effect once preparation finishes, and the prompt is not sent. Cancel does not stop model or thinking changes, session switches, or the restoration of one-shot settings after a response; `:MentatRestart` stops the Pi process instead. Repeating Cancel sends one abort, and Cancel while idle reports that nothing is running.
+
+Status reads Mentat's own record of the operation and sends no command to Pi, so it answers immediately while a request is running and does not start Pi when the plugin is idle. Its phases are Idle, Starting, Generating, Running tool, Compacting, Cancelling, and Finishing. Starting covers process startup, settings changes, session switches, and request preparation; Finishing covers the state refresh and settings restoration after a response has settled. When the running tool is `subagent`, Status lists each child reported by the tool's latest progress update with its running or done state and turn count; before the first update it reports that subagent progress is unavailable.
 
 ## Defaults and presets
 
@@ -73,7 +83,7 @@ Daily logs remain append-only across Neovim instances. Opening and closing a log
 
 ## Tests
 
-Tested with Neovim `v0.13.0-dev-1510+gce8a897f98-Homebrew`. Run from the repository root:
+Tested with Neovim `v0.13.0-dev-1855+g326d764e3e-Homebrew`. Run from the repository root:
 
 ```sh
 nvim --headless -u NONE --noplugin -l tests/run.lua
@@ -83,4 +93,4 @@ git diff --check
 
 The tests mock Pi jobs, channels, catalogs, and session files. They use real Neovim buffers, filesystem I/O, subprocesses, TCP sockets, and timers, with bounded fixture waits. They require no Pi credentials and send no model prompts.
 
-Coverage includes response layout and timing, selection/restoration, LSP aggregation and cancellation, concurrent bridge requests, and callback-triggered process restarts with trailing stdout/stderr. Filesystem and workflow cases cover late-opened descriptors, temporary-file ownership, branch/review/picker disposal, repository capture across yields, and partial log writes with exactly-once exit flushing. Each case checks for remaining async tasks, active libuv handles, and Neovim errors after cleanup.
+Coverage includes response layout and timing, selection/restoration, request cancellation and live status, LSP aggregation and cancellation, concurrent bridge requests, and callback-triggered process restarts with trailing stdout/stderr. Filesystem and workflow cases cover late-opened descriptors, temporary-file ownership, branch/review/picker disposal, repository capture across yields, and partial log writes with exactly-once exit flushing. Each case checks for remaining async tasks, active libuv handles, and Neovim errors after cleanup.

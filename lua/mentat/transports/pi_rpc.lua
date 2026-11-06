@@ -116,13 +116,23 @@ local function text_content(content)
   return table.concat(parts)
 end
 
+local function tool_argument(args)
+  if type(args) ~= "table" then
+    return nil
+  end
+  local arg = args.path or args.pattern or args.command or args.query or args.ref or args.agent
+  if arg ~= nil and arg ~= vim.NIL then
+    return tostring(arg)
+  end
+end
+
 local function tool_summary(name, args)
   if type(name) ~= "string" or name == "" then
     return nil
   end
-  local arg = type(args) == "table" and (args.path or args.pattern or args.command or args.query or args.ref) or nil
+  local arg = tool_argument(args)
   if arg then
-    return string.format("\n\n> *%s: %s*\n\n", name, tostring(arg))
+    return string.format("\n\n> *%s: %s*\n\n", name, arg)
   end
   return string.format("\n\n> *%s*\n\n", name)
 end
@@ -266,7 +276,7 @@ local function new_client()
     if client.is_busy() then
       return nil, "Pi is busy; wait for the current operation to settle"
     end
-    local op = { kind = kind, on_done = on_done or function() end }
+    local op = { kind = kind, started = uv.hrtime(), on_done = on_done or function() end }
     op.fail = function(err, status)
       if op.prompt then
         finish(op, prompt_result(op, err, status))
@@ -583,10 +593,40 @@ local function new_client()
     prompt.settled = true
     prompt.error = err
     prompt.status = status
+    prompt.tools = {}
     prompt.metadata.total_ms = (uv.hrtime() - prompt.started) / 1e6
     if prompt.wake then
       prompt.wake()
     end
+  end
+
+  local function send_abort(op)
+    if op.abort_task then
+      return
+    end
+    local task = async.run("mentat Pi abort", function()
+      async.await(vim.schedule)
+      local response, err = request(op, { type = "abort" }, true)
+      if not response or not response.success then
+        terminate(err or (response and response.error) or "Failed to abort Pi", "aborted")
+      end
+    end):detach()
+    op.abort_task = task
+    task:on_complete(function(err)
+      on_main(function()
+        if err and err ~= "closed" and operation == op then
+          terminate(tostring(err), "aborted")
+        end
+      end)
+    end)
+  end
+
+  local function tool_key(event)
+    local id = value(event.toolCallId)
+    if id ~= nil then
+      return tostring(id)
+    end
+    return type(event.toolName) == "string" and event.toolName or nil
   end
 
   local function handle_event(event)
@@ -601,6 +641,9 @@ local function new_client()
       state.is_streaming = true
       if prompt then
         prompt.agent_started = true
+        if prompt.aborted and not prompt.settled then
+          send_abort(op)
+        end
       end
       changed()
     elseif event.type == "compaction_start" then
@@ -638,11 +681,22 @@ local function new_client()
         end
       elseif event.type == "message_end" and type(event.message) == "table" and event.message.role == "assistant" then
         final_message(prompt, event.message)
-      elseif event.type == "tool_execution_start" and prompt.on_chunk then
-        local summary = tool_summary(event.toolName, event.args)
+      elseif event.type == "tool_execution_start" then
+        local key = tool_key(event)
+        if key then
+          prompt.tools[key] = { name = event.toolName, arg = tool_argument(event.args), started = uv.hrtime() }
+        end
+        local summary = prompt.on_chunk and tool_summary(event.toolName, event.args)
         if summary then
           prompt.on_chunk(summary)
         end
+      elseif event.type == "tool_execution_update" then
+        local tool = prompt.tools[tool_key(event) or ""]
+        if tool then
+          tool.partial = value(event.partialResult)
+        end
+      elseif event.type == "tool_execution_end" then
+        prompt.tools[tool_key(event) or ""] = nil
       elseif event.type == "auto_retry_end" then
         prompt.retry_error = event.success == false and (value(event.finalError) or "Pi retries failed") or nil
       end
@@ -821,8 +875,9 @@ local function new_client()
       return false, err
     end
     local prompt = {
-      started = uv.hrtime(),
+      started = op.started,
       text = "",
+      tools = {},
       metadata = { models = {}, status = "pending" },
       on_chunk = on_chunk,
       on_metadata = opts.on_metadata,
@@ -833,11 +888,19 @@ local function new_client()
       if not ok then
         return prompt_result(op, prepare_err)
       end
+      if prompt.aborted then
+        settled(prompt, nil, "aborted")
+        return settle_prompt(op)
+      end
       if opts.override then
         restore_selection = models.from_state(state)
         local selected, selection_err = apply_selection(op, opts.override)
         if not selected then
           settled(prompt, selection_err, "error")
+          return settle_prompt(op)
+        end
+        if prompt.aborted then
+          settled(prompt, nil, "aborted")
           return settle_prompt(op)
         end
       end
@@ -888,30 +951,65 @@ local function new_client()
 
   function client.abort()
     local op = operation
-    if not op or not op.prompt then
-      return false, "No Pi prompt to abort"
+    if not op then
+      return false, "Nothing is running."
     end
-    op.prompt.aborted = true
-    if not op.prompt.agent_started or op.prompt.settled then
-      terminate("Pi request aborted", "aborted")
-    elseif not op.abort_task then
-      local task = async.run("mentat Pi abort", function()
-        async.await(vim.schedule)
-        local response, err = request(op, { type = "abort" }, true)
-        if not response or not response.success then
-          terminate(err or (response and response.error) or "Failed to abort Pi", "aborted")
-        end
-      end):detach()
-      op.abort_task = task
-      task:on_complete(function(err)
-        on_main(function()
-          if err and err ~= "closed" and operation == op then
-            terminate(tostring(err), "aborted")
-          end
-        end)
-      end)
+    local prompt = op.prompt
+    if not prompt or prompt.settled then
+      return false, "The current operation cannot be cancelled; wait for it to settle."
+    end
+    if prompt.aborted then
+      return true
+    end
+    prompt.aborted = true
+    if prompt.agent_started then
+      send_abort(op)
     end
     return true
+  end
+
+  function client.status()
+    local op = operation
+    local snapshot = {
+      phase = "idle",
+      ready = state.ready,
+      model = vim.deepcopy(state.model),
+      thinking = state.thinking_level,
+      tools = {},
+    }
+    if not op then
+      return snapshot
+    end
+    snapshot.kind = op.kind
+    snapshot.elapsed_ms = (uv.hrtime() - op.started) / 1e6
+    snapshot.phase = "starting"
+    local prompt = op.prompt
+    if not prompt then
+      return snapshot
+    end
+    for _, tool in pairs(prompt.tools) do
+      table.insert(snapshot.tools, {
+        name = tool.name,
+        arg = tool.arg,
+        elapsed_ms = (uv.hrtime() - tool.started) / 1e6,
+        partial = tool.partial,
+      })
+    end
+    table.sort(snapshot.tools, function(a, b)
+      return a.elapsed_ms > b.elapsed_ms
+    end)
+    if prompt.settled then
+      snapshot.phase = "finishing"
+    elseif prompt.aborted then
+      snapshot.phase = "cancelling"
+    elseif state.is_compacting then
+      snapshot.phase = "compacting"
+    elseif #snapshot.tools > 0 then
+      snapshot.phase = "tool"
+    elseif prompt.agent_started or state.is_streaming then
+      snapshot.phase = "generating"
+    end
+    return snapshot
   end
 
   local function select_settings(selection, on_done)

@@ -36,6 +36,17 @@ end, { desc = "Select this conversation's thinking level" })
 vim.keymap.set("n", "<leader>mm", "<Cmd>MentatModel<CR>", { desc = "Select Mentat model" })
 vim.keymap.set("n", "<leader>mr", "<Cmd>MentatThinking<CR>", { desc = "Select Mentat thinking level" })
 
+vim.api.nvim_create_user_command("MentatCancel", function()
+  require("mentat.operation").cancel()
+end, { desc = "Cancel this conversation's current request" })
+
+vim.api.nvim_create_user_command("MentatStatus", function()
+  require("mentat.operation").status()
+end, { desc = "Show this conversation's current operation" })
+
+vim.keymap.set("n", "<leader>mx", "<Cmd>MentatCancel<CR>", { desc = "Cancel Mentat request" })
+vim.keymap.set("n", "<leader>mi", "<Cmd>MentatStatus<CR>", { desc = "Show Mentat status" })
+
 vim.api.nvim_create_user_command("MentatPromote", function()
   if not require("mentat.branch").promote() then
     require("mentat.buffer").promote()
