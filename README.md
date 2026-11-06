@@ -9,8 +9,8 @@ Mentat runs Pi conversations in Neovim. This version uses the Pi 0.85.1 RPC cont
 | `:MentatModel` | `<leader>mm` | Select a model from Pi's available catalog. |
 | `:MentatThinking` | `<leader>mr` | Select a supported thinking level for the current model. |
 | `:MentatPromote` | `<leader>mp` | Resend the last prompt with `big` in the current conversation. |
-| `:MentatCancel` | `<leader>mx` | Cancel the current request in this conversation. |
-| `:MentatStatus` | `<leader>mi` | Show the current operation in this conversation. |
+| `:MentatCancel` | `<leader>mx` | Cancel the current request. |
+| `:MentatStatus` | `<leader>mi` | Inspect the current operation without waiting for it to finish. |
 
 The selectors target the focused branch, or the main conversation when invoked from an ordinary editor buffer. They capture that target before opening the picker. Model entries show provider/model IDs, the current choice, and matching configured preset labels. A model change can adjust the thinking level; the winbar shows the confirmed result.
 
@@ -24,11 +24,17 @@ Selectors and additional sends are rejected while a request is preparing, stream
 
 ## Cancel and Status
 
-Use Cancel to stop the current operation without restarting Mentat. The conversation and any partial response remain available. Use Status to inspect the current operation while it is running. Status shows the available execution phase, elapsed time, and current tool.
+Use `:MentatCancel` to interrupt a request and keep the conversation and partial response. Use `:MentatStatus` to inspect its phase, elapsed time, current tools, model, and thinking level. Both commands target the focused branch, or the main conversation when invoked from another buffer. They appear in `:Mentat` command completion.
 
-Cancel and Status act on the focused branch, or on the main conversation from any other buffer. Cancel applies to requests. During generation, tool execution, and compaction it sends Pi's abort; the response ends with `Status: aborted` and keeps the text received so far. A cancel during request preparation takes effect once preparation finishes, and the prompt is not sent. Cancel does not stop model or thinking changes, session switches, or the restoration of one-shot settings after a response; `:MentatRestart` stops the Pi process instead. Repeating Cancel sends one abort, and Cancel while idle reports that nothing is running.
+Cancellation normally leaves Pi running for the next request. During preparation, Mentat waits for preparation to finish, skips the prompt, and restores any one-request model override. Once the prompt has been sent, cancellation waits for Pi to start the run before sending abort. This also means pre-run compaction is not interrupted. Repeated cancellation sends at most one abort; cancelling while idle reports that nothing is running. Partial text remains in the response with `Status: aborted`.
 
-Status reads Mentat's own record of the operation and sends no command to Pi, so it answers immediately while a request is running and does not start Pi when the plugin is idle. Its phases are Idle, Starting, Generating, Running tool, Compacting, Cancelling, and Finishing. Starting covers process startup, settings changes, session switches, and request preparation; Finishing covers the state refresh and settings restoration after a response has settled. When the running tool is `subagent`, Status lists each child reported by the tool's latest progress update with its running or done state and turn count; before the first update it reports that subagent progress is unavailable.
+Model and thinking changes, session switches, and settings restoration after a response cannot be cancelled. If Pi hangs before starting a run, cancellation can remain pending; use `:MentatRestart` to stop the process. If sending abort fails or Pi rejects it, Mentat stops the process, preserves the partial response with the error, and starts a new process for the next request.
+
+Status reads local state without sending an RPC, starting Pi, or creating a conversation buffer. It displays Idle, Starting, Generating, Running tool, Compacting, Cancelling, or Finishing. Starting includes preparation and settings/session operations; Finishing includes the state refresh and settings restoration after a response.
+
+For a running subagent tool, Status shows the child states and turn counts from its latest progress update. Child states distinguish running, finished, failed, cancelled, and unavailable status. Updates may be absent during a long child tool call; silence does not mean the child is stuck. Before any progress update arrives, Status reports that subagent progress is unavailable. Output appears in Neovim's message area and can be recalled with `:messages`.
+
+Subagent cancellation depends on the installed extension forwarding Pi's abort signal to its child processes. For `pv-pi-subagent`, this path was checked in the installed Pi code and the extension's offline cancellation tests. A live model-driven cancellation was not tested.
 
 ## Defaults and presets
 
